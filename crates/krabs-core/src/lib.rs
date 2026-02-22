@@ -1,0 +1,22 @@
+pub mod agents;
+pub mod config;
+pub mod mcp;
+pub mod memory;
+pub mod permissions;
+pub mod prompts;
+pub mod providers;
+pub mod session;
+pub mod skills;
+pub mod tools;
+
+pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
+pub use config::config::KrabsConfig;
+pub use config::credentials::Credentials;
+pub use providers::provider::{LlmProvider, LlmResponse, Message, Role, StreamChunk, ToolCall};
+pub use providers::{AnthropicProvider, OpenAiProvider};
+pub use tools::bash::BashTool;
+pub use tools::glob::GlobTool;
+pub use tools::read::ReadTool;
+pub use tools::registry::ToolRegistry;
+pub use tools::tool::{Tool, ToolDef, ToolResult};
+pub use tools::write::WriteTool;

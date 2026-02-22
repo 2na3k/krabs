@@ -1,0 +1,33 @@
+[package]
+name = "krabs-core"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "krabs-core"
+path = "src/main.rs"
+
+[lib]
+name = "krabs_core"
+path = "src/lib.rs"
+
+[[example]]
+name = "basic_agent"
+path = "../../example/basic_agent.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "=0.3.31"
+thiserror = "2"
+glob = "0.3"
+walkdir = "2"
+regex = "1"
+tracing = "0.1"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"

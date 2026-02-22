@@ -1,0 +1,17 @@
+[package]
+name = "krabs-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "krabs"
+path = "src/main.rs"
+
+[dependencies]
+krabs-core = { path = "../krabs-core" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+rustyline = "14"
+async-trait = "0.1"
+dirs = "5"
+rpassword = "7"

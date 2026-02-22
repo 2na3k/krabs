@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/krabs-core",
+    "crates/krabs-cli",
+    # "crates/krabs-server",  # not yet scaffolded
+    # "crates/krabs-mcp",     # not yet scaffolded
+    # "crates/krabs-sdk",     # not yet scaffolded
+]
 resolver = "2"
-
-[dependencies]
