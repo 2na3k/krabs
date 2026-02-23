@@ -207,7 +207,7 @@ impl LlmProvider for AnthropicProvider {
                                 serde_json::from_str(&args_str).unwrap_or(json!({}));
                             let _ = tx
                                 .send(StreamChunk::ToolCallReady {
-                                    call: ToolCall { id, name, args },
+                                    call: ToolCall { id, name, args, thought_signature: None },
                                 })
                                 .await;
                         }

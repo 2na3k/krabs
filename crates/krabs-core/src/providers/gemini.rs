@@ -7,25 +7,23 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-pub struct OpenAiProvider {
+pub struct GeminiProvider {
     client: Client,
-    base_url: String,
     api_key: String,
     model: String,
 }
 
-impl OpenAiProvider {
-    pub fn new(
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
+impl GeminiProvider {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
-            base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
         }
+    }
+
+    fn base_url(&self) -> String {
+        "https://generativelanguage.googleapis.com/v1beta/openai".to_string()
     }
 }
 
@@ -42,14 +40,19 @@ fn build_messages(messages: &[Message]) -> Vec<Value> {
             if let Some(calls) = &m.tool_calls {
                 let tc_arr: Vec<Value> = calls
                     .iter()
-                    .map(|c| json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": {
+                    .map(|c| {
+                        let func = json!({
                             "name": c.name,
                             "arguments": c.args.to_string()
+                        });
+                        let mut tc = json!({ "id": c.id, "type": "function", "function": func });
+                        if let Some(sig) = &c.thought_signature {
+                            tc["extra_content"] = json!({
+                                "google": { "thought_signature": sig }
+                            });
                         }
-                    }))
+                        tc
+                    })
                     .collect();
                 return json!({ "role": role, "content": null, "tool_calls": tc_arr });
             }
@@ -71,8 +74,24 @@ fn build_tools(tools: &[ToolDef]) -> Vec<Value> {
         .collect()
 }
 
+fn flush_tool_calls(
+    tool_calls: &mut std::collections::HashMap<usize, (String, String, String, Option<String>)>,
+) -> Vec<ToolCall> {
+    let mut indices: Vec<usize> = tool_calls.keys().cloned().collect();
+    indices.sort();
+    indices
+        .into_iter()
+        .filter_map(|idx| {
+            tool_calls.remove(&idx).map(|(id, name, args_str, thought_signature)| {
+                let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
+                ToolCall { id, name, args, thought_signature }
+            })
+        })
+        .collect()
+}
+
 #[async_trait]
-impl LlmProvider for OpenAiProvider {
+impl LlmProvider for GeminiProvider {
     async fn complete(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse> {
         let msgs = build_messages(messages);
         let tools_val = build_tools(tools);
@@ -82,7 +101,7 @@ impl LlmProvider for OpenAiProvider {
             body["tools"] = json!(tools_val);
         }
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/chat/completions", self.base_url());
         let resp = self
             .client
             .post(&url)
@@ -115,7 +134,10 @@ impl LlmProvider for OpenAiProvider {
                             let name = tc["function"]["name"].as_str()?.to_string();
                             let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                             let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-                            Some(ToolCall { id, name, args, thought_signature: None })
+                            let thought_signature = tc["extra_content"]["google"]["thought_signature"]
+                                .as_str()
+                                .map(|s| s.to_string());
+                            Some(ToolCall { id, name, args, thought_signature })
                         })
                         .collect::<Vec<_>>()
                 })
@@ -146,7 +168,7 @@ impl LlmProvider for OpenAiProvider {
             body["tools"] = json!(tools_val);
         }
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/chat/completions", self.base_url());
         let raw_resp = self
             .client
             .post(&url)
@@ -160,8 +182,8 @@ impl LlmProvider for OpenAiProvider {
             anyhow::bail!("status {status}: {body_text}");
         }
 
-        // index -> (id, name, args)
-        let mut tool_calls: std::collections::HashMap<usize, (String, String, String)> =
+        // index -> (id, name, args, thought_signature)
+        let mut tool_calls: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
             std::collections::HashMap::new();
         let mut last_usage: Option<TokenUsage> = None;
         let mut byte_stream = raw_resp.bytes_stream();
@@ -188,6 +210,7 @@ impl LlmProvider for OpenAiProvider {
                     Err(_) => continue,
                 };
 
+                // Gemini sends usage on every chunk — track the last one
                 if let Some(usage) = delta.get("usage").filter(|u| !u.is_null()) {
                     last_usage = Some(TokenUsage {
                         input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
@@ -195,7 +218,6 @@ impl LlmProvider for OpenAiProvider {
                     });
                 }
 
-                // Skip usage-only chunks (no choices)
                 let choices = delta["choices"].as_array();
                 if choices.map(|c| c.is_empty()).unwrap_or(true) {
                     continue;
@@ -216,7 +238,7 @@ impl LlmProvider for OpenAiProvider {
                         let idx = tc["index"].as_u64().unwrap_or(0) as usize;
                         let entry = tool_calls
                             .entry(idx)
-                            .or_insert_with(|| (String::new(), String::new(), String::new()));
+                            .or_insert_with(|| (String::new(), String::new(), String::new(), None));
                         if let Some(id) = tc["id"].as_str() {
                             entry.0 = id.to_string();
                         }
@@ -226,40 +248,25 @@ impl LlmProvider for OpenAiProvider {
                         if let Some(args) = tc["function"]["arguments"].as_str() {
                             entry.2.push_str(args);
                         }
+                        // Gemini embeds thought_signature in extra_content.google
+                        if let Some(sig) = tc["extra_content"]["google"]["thought_signature"].as_str() {
+                            entry.3.get_or_insert_with(String::new).push_str(sig);
+                        }
                     }
                 }
 
+                // Gemini may use finish_reason "stop" instead of "tool_calls"
                 if finish_reason == "tool_calls" {
-                    let mut indices: Vec<usize> = tool_calls.keys().cloned().collect();
-                    indices.sort();
-                    for idx in indices {
-                        if let Some((id, name, args_str)) = tool_calls.remove(&idx) {
-                            let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
-                            let _ = tx
-                                .send(StreamChunk::ToolCallReady {
-                                    call: ToolCall { id, name, args, thought_signature: None },
-                                })
-                                .await;
-                        }
+                    for call in flush_tool_calls(&mut tool_calls) {
+                        let _ = tx.send(StreamChunk::ToolCallReady { call }).await;
                     }
                 }
             }
         }
 
-        // Flush any remaining tool calls
-        if !tool_calls.is_empty() {
-            let mut indices: Vec<usize> = tool_calls.keys().cloned().collect();
-            indices.sort();
-            for idx in indices {
-                if let Some((id, name, args_str)) = tool_calls.remove(&idx) {
-                    let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
-                    let _ = tx
-                        .send(StreamChunk::ToolCallReady {
-                            call: ToolCall { id, name, args, thought_signature: None },
-                        })
-                        .await;
-                }
-            }
+        // Flush any remaining tool calls (Gemini finish_reason "stop" case)
+        for call in flush_tool_calls(&mut tool_calls) {
+            let _ = tx.send(StreamChunk::ToolCallReady { call }).await;
         }
 
         let usage = last_usage.unwrap_or(TokenUsage { input_tokens: 0, output_tokens: 0 });

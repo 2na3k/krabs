@@ -17,36 +17,25 @@ pub struct Message {
     pub role: Role,
     pub content: String,
     pub tool_call_id: Option<String>,
+    /// Populated on assistant messages that requested tool calls
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::System,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Self { role: Role::System, content: content.into(), tool_call_id: None, tool_calls: None }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::User,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Self { role: Role::User, content: content.into(), tool_call_id: None, tool_calls: None }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: content.into(),
-            tool_call_id: None,
-        }
+        Self { role: Role::Assistant, content: content.into(), tool_call_id: None, tool_calls: None }
+    }
+    pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self { role: Role::Assistant, content: String::new(), tool_call_id: None, tool_calls: Some(calls) }
     }
     pub fn tool_result(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
-        Self {
-            role: Role::Tool,
-            content: content.into(),
-            tool_call_id: Some(tool_call_id.into()),
-        }
+        Self { role: Role::Tool, content: content.into(), tool_call_id: Some(tool_call_id.into()), tool_calls: None }
     }
 }
 
@@ -55,6 +44,9 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub args: serde_json::Value,
+    /// Gemini thinking models attach a thought_signature that must be echoed back
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

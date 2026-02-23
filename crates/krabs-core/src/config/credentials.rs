@@ -1,5 +1,5 @@
 use crate::providers::provider::LlmProvider;
-use crate::providers::{AnthropicProvider, OpenAiProvider};
+use crate::providers::{AnthropicProvider, GeminiProvider, OpenAiProvider};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -46,18 +46,18 @@ impl Credentials {
     }
 
     pub fn build_provider(&self) -> Box<dyn LlmProvider> {
-        if self.provider == "anthropic" {
-            Box::new(AnthropicProvider::new(
+        match self.provider.as_str() {
+            "anthropic" => Box::new(AnthropicProvider::new(
                 &self.base_url,
                 &self.api_key,
                 &self.model,
-            ))
-        } else {
-            Box::new(OpenAiProvider::new(
+            )),
+            "gemini" | "google" => Box::new(GeminiProvider::new(&self.api_key, &self.model)),
+            _ => Box::new(OpenAiProvider::new(
                 &self.base_url,
                 &self.api_key,
                 &self.model,
-            ))
+            )),
         }
     }
 }
