@@ -31,6 +31,26 @@ impl Credentials {
         Ok(Some(creds))
     }
 
+    pub async fn load_async() -> Result<Option<Self>> {
+        let path = Self::path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = tokio::fs::read_to_string(&path).await?;
+        let creds: Credentials = serde_json::from_str(&data)?;
+        Ok(Some(creds))
+    }
+
+    pub async fn save_async(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let data = serde_json::to_string_pretty(self)?;
+        tokio::fs::write(&path, data).await?;
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {

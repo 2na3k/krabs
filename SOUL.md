@@ -11,7 +11,7 @@ Krabs is a Rust-native agentic framework built for one purpose: **getting things
 
 Krabs doesn't meander. Krabs doesn't apologize for being fast. Krabs claws forward.
 
-Krabs also have this ![wiki page](https://spongebob.fandom.com/wiki/Eugene_H._Krabs)
+Krabs also have this ![wiki page](https://spongebob.fandom.com/wiki/Eugene_H._Krabs).
 
 ---
 

@@ -559,8 +559,8 @@ fn cmd_skills(app: &mut App) {
     }
 }
 
-fn cmd_mcp(app: &mut App) {
-    let reg = McpRegistry::load();
+async fn cmd_mcp(app: &mut App) {
+    let reg = McpRegistry::load().await;
     if reg.servers.is_empty() {
         app.push(ChatMsg::Info(
             "no MCP servers configured — add to ~/.krabs/mcp.json".into(),
@@ -901,7 +901,7 @@ pub async fn run(creds: Credentials) -> Result<()> {
                             }
                             "/tools"  => cmd_tools(&mut app, &registry),
                             "/skills" => cmd_skills(&mut app),
-                            "/mcp"    => cmd_mcp(&mut app),
+                            "/mcp"    => cmd_mcp(&mut app).await,
                             "/usage"  => cmd_usage(&mut app, max_ctx),
                             _ => {
                                 app.push(ChatMsg::User(input.clone()));

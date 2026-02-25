@@ -21,12 +21,10 @@ impl McpRegistry {
             .join("mcp.json")
     }
 
-    pub fn load() -> Self {
+    pub async fn load() -> Self {
         let path = Self::path();
-        if !path.exists() {
-            return Self::default();
-        }
-        std::fs::read_to_string(&path)
+        tokio::fs::read_to_string(&path)
+            .await
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
