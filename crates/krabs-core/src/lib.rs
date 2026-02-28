@@ -11,15 +11,18 @@ pub mod skills;
 pub mod tools;
 
 pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
+pub use agents::persona::AgentPersona;
 pub use config::config::{KrabsConfig, SkillsConfig};
 pub use config::credentials::Credentials;
 pub use hooks::{
     Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, ToolUseDecision,
 };
-pub use mcp::mcp::{McpRegistry, McpServer};
+pub use mcp::mcp::{LiveMcpRegistry, McpRegistry, McpServer};
+pub use mcp::{McpClient, McpReadResourceTool, McpTool};
 pub use providers::provider::{
     LlmProvider, LlmResponse, Message, Role, StreamChunk, TokenUsage, ToolCall,
 };
+
 pub use providers::{AnthropicProvider, GeminiProvider, OpenAiProvider};
 pub use skills::{FsSkill, SkillRegistry};
 pub use tools::bash::BashTool;

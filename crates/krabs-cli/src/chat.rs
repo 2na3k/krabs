@@ -7,9 +7,9 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use krabs_core::{
-    skills::loader::SkillLoader, BashTool, Credentials, GlobTool, GrepTool, HookConfig, HookEntry,
-    KrabsConfig, LlmProvider, McpRegistry, Message, ReadTool, SkillsConfig, StreamChunk,
-    TokenUsage, ToolCall, ToolDef, ToolRegistry, WriteTool,
+    skills::loader::SkillLoader, AgentPersona, BashTool, Credentials, GlobTool, GrepTool,
+    HookConfig, HookEntry, KrabsConfig, LlmProvider, McpRegistry, McpServer, Message, ReadTool,
+    Role, SkillsConfig, StreamChunk, TokenUsage, ToolCall, ToolDef, ToolRegistry, WriteTool,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -29,11 +29,15 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "list available tools"),
     ("/skills", "list project skills"),
-    ("/mcp", "list connected MCP servers"),
+    (
+        "/mcp",
+        "list/add/remove MCP servers  usage: /mcp [list|add|add-sse|remove|tools]",
+    ),
     (
         "/hooks",
         "list/add/remove hooks  usage: /hooks [list|add|remove]",
     ),
+    ("/agents", "list agent personas  |  use @<name> to activate"),
     ("/usage", "show context window usage"),
     ("/clear", "clear screen and conversation"),
     ("/quit", "exit Krabs"),
@@ -190,6 +194,8 @@ struct App {
     total_input: u32,
     total_output: u32,
     suggest_idx: Option<usize>, // selected index in suggestion popup
+    active_persona: Option<AgentPersona>,
+    personas: Vec<AgentPersona>,
 }
 
 impl App {
@@ -207,6 +213,8 @@ impl App {
             spin_i: 0,
             total_input: 0,
             total_output: 0,
+            active_persona: None,
+            personas: Vec::new(),
         }
     }
 
@@ -393,6 +401,47 @@ fn slash_suggestions(prefix: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// Return persona names whose names start with `prefix` (after stripping `@`).
+fn at_suggestions<'a>(prefix: &str, personas: &'a [AgentPersona]) -> Vec<(&'a str, &'a str)> {
+    personas
+        .iter()
+        .filter(|p| p.name.starts_with(prefix))
+        .map(|p| (p.name.as_str(), p.description.as_deref().unwrap_or("")))
+        .collect()
+}
+
+fn cmd_agents(app: &mut App, args: &str) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.as_slice() {
+        [] | ["list"] => {
+            let personas = AgentPersona::discover();
+            app.personas = personas;
+            if app.personas.is_empty() {
+                app.push(ChatMsg::Info(
+                    "no agent personas found — add markdown files to ./krabs/agents/".into(),
+                ));
+            } else {
+                let lines: Vec<String> = {
+                    let mut v = vec![format!("{} persona(s):", app.personas.len())];
+                    for p in &app.personas {
+                        let desc = p.description.as_deref().unwrap_or("");
+                        v.push(format!("  @{:<20}  {}", p.name, desc));
+                    }
+                    v
+                };
+                for line in lines {
+                    app.push(ChatMsg::Info(line));
+                }
+            }
+        }
+        _ => {
+            app.push(ChatMsg::Error(
+                "usage: /agents [list]  |  type @<name> to activate a persona".into(),
+            ));
+        }
+    }
+}
+
 // ── rendering ────────────────────────────────────────────────────────────────
 
 struct InfoBar {
@@ -404,12 +453,13 @@ struct InfoBar {
 
 fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
     let area = frame.area();
+    let info_height: u16 = if app.active_persona.is_some() { 7 } else { 6 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6), // info box
-            Constraint::Min(1),    // chat
-            Constraint::Length(3), // input
+            Constraint::Length(info_height), // info box
+            Constraint::Min(1),              // chat
+            Constraint::Length(3),           // input
         ])
         .split(area);
 
@@ -423,7 +473,7 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
         "░".repeat(20 - filled),
         pct
     );
-    let info_lines = vec![
+    let mut info_lines = vec![
         Line::from(vec![
             Span::styled("  provider  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -453,6 +503,17 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
             Span::styled(ctx_bar, Style::default().fg(Color::Yellow)),
         ]),
     ];
+    if let Some(ref persona) = app.active_persona {
+        info_lines.push(Line::from(vec![
+            Span::styled("  persona ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("@{}", persona.name),
+                Style::default()
+                    .fg(MR_KRABS_ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     let info_widget = Paragraph::new(info_lines).block(
         Block::default()
             .borders(Borders::ALL)
@@ -572,6 +633,54 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
             frame.render_widget(popup, pop_rect);
         }
     }
+
+    // @<name> suggestion popup
+    if !app.spinning && app.input.starts_with('@') && !app.input.contains(' ') {
+        let prefix = &app.input[1..];
+        let suggestions = at_suggestions(prefix, &app.personas);
+        if !suggestions.is_empty() {
+            let pop_h = suggestions.len() as u16 + 2;
+            let pop_w = 44u16.min(area.width);
+            let pop_x = chunks[2].x + 1;
+            let pop_y = chunks[2].y.saturating_sub(pop_h);
+            let pop_rect = ratatui::layout::Rect::new(pop_x, pop_y, pop_w, pop_h);
+
+            let popup_lines: Vec<Line> = suggestions
+                .iter()
+                .enumerate()
+                .map(|(i, (name, desc))| {
+                    let selected = app.suggest_idx == Some(i);
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(MR_KRABS_ORANGE)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let desc_style = if selected {
+                        Style::default().fg(Color::Black).bg(MR_KRABS_ORANGE)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    Line::from(vec![
+                        Span::styled(format!(" @{:<12}", name), style),
+                        Span::styled(format!(" {}", desc), desc_style),
+                    ])
+                })
+                .collect();
+
+            let popup = Paragraph::new(popup_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MR_KRABS_ORANGE))
+                    .title(Span::styled(
+                        " personas ",
+                        Style::default().fg(MR_KRABS_ORANGE),
+                    )),
+            );
+
+            frame.render_widget(ratatui::widgets::Clear, pop_rect);
+            frame.render_widget(popup, pop_rect);
+        }
+    }
 }
 
 // ── slash command helpers ────────────────────────────────────────────────────
@@ -597,17 +706,104 @@ fn cmd_skills(app: &mut App, skills_config: &SkillsConfig) {
     }
 }
 
-async fn cmd_mcp(app: &mut App) {
-    let reg = McpRegistry::load().await;
-    if reg.servers.is_empty() {
-        app.push(ChatMsg::Info(
-            "no MCP servers configured — add to ~/.krabs/mcp.json".into(),
-        ));
-    } else {
-        app.push(ChatMsg::Info("MCP servers:".into()));
-        for s in &reg.servers {
-            let dot = if s.enabled { "●" } else { "○" };
-            app.push(ChatMsg::Info(format!("  {} {:20}  {}", dot, s.name, s.url)));
+/// /mcp                          — list configured servers
+/// /mcp add <name> <cmd> [args…] — add a stdio server
+/// /mcp add-sse <name> <url>     — add an SSE server
+/// /mcp remove <name>            — remove a server
+/// /mcp tools                    — list tools from all connected servers
+async fn cmd_mcp(app: &mut App, args: &str) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+
+    match parts.as_slice() {
+        // /mcp  or  /mcp list
+        [] | ["list"] => {
+            let reg = McpRegistry::load().await;
+            if reg.servers.is_empty() {
+                app.push(ChatMsg::Info("no MCP servers configured".into()));
+                app.push(ChatMsg::Info(
+                    "  /mcp add <name> <command> [args…]    — stdio server".into(),
+                ));
+                app.push(ChatMsg::Info(
+                    "  /mcp add-sse <name> <url>            — SSE server".into(),
+                ));
+            } else {
+                app.push(ChatMsg::Info("MCP servers:".into()));
+                for s in &reg.servers {
+                    let dot = if s.enabled { "●" } else { "○" };
+                    let transport = s.transport_label();
+                    let endpoint = s.endpoint();
+                    app.push(ChatMsg::Info(format!(
+                        "  {} {:20}  [{transport}] {endpoint}",
+                        dot, s.name
+                    )));
+                }
+            }
+        }
+
+        ["add", name, rest @ ..] if !rest.is_empty() => {
+            let command = rest[0];
+            let server_args: Vec<String> = rest[1..].iter().map(|s| s.to_string()).collect();
+            let server = McpServer::stdio(*name, command, server_args);
+            let mut reg = McpRegistry::load().await;
+            reg.add(server);
+            if let Err(e) = reg.save().await {
+                app.push(ChatMsg::Error(format!("failed to save: {e}")));
+            } else {
+                app.push(ChatMsg::Info(format!("added stdio server '{name}'")));
+            }
+        }
+
+        ["add-sse", name, url] => {
+            let server = McpServer::sse(*name, *url);
+            let mut reg = McpRegistry::load().await;
+            reg.add(server);
+            if let Err(e) = reg.save().await {
+                app.push(ChatMsg::Error(format!("failed to save: {e}")));
+            } else {
+                app.push(ChatMsg::Info(format!("added SSE server '{name}'")));
+            }
+        }
+
+        ["remove", name] => {
+            let mut reg = McpRegistry::load().await;
+            if reg.remove(name) {
+                if let Err(e) = reg.save().await {
+                    app.push(ChatMsg::Error(format!("failed to save: {e}")));
+                } else {
+                    app.push(ChatMsg::Info(format!("removed server '{name}'")));
+                }
+            } else {
+                app.push(ChatMsg::Error(format!("server '{name}' not found")));
+            }
+        }
+
+        ["tools"] => {
+            let reg = McpRegistry::load().await;
+            if reg.servers.is_empty() {
+                app.push(ChatMsg::Info("no MCP servers configured".into()));
+                return;
+            }
+            app.push(ChatMsg::Info("connecting to MCP servers…".into()));
+            let live = reg.connect_all().await;
+            if live.is_empty() {
+                app.push(ChatMsg::Error("no servers connected".into()));
+                return;
+            }
+            let tools = live.tools_for_all().await;
+            if tools.is_empty() {
+                app.push(ChatMsg::Info("no tools discovered".into()));
+            } else {
+                app.push(ChatMsg::Info(format!("{} MCP tools:", tools.len())));
+                for t in &tools {
+                    app.push(ChatMsg::Info(format!("  {}", t.name())));
+                }
+            }
+        }
+
+        _ => {
+            app.push(ChatMsg::Info(
+                "usage: /mcp [list|add <name> <cmd> [args…]|add-sse <name> <url>|remove <name>|tools]".into(),
+            ));
         }
     }
 }
@@ -826,7 +1022,7 @@ async fn show_splash(
 
 pub async fn run(creds: Credentials) -> Result<()> {
     let krabs_config = KrabsConfig::load().unwrap_or_default();
-    let provider: Arc<dyn LlmProvider> = Arc::from(creds.build_provider());
+    let mut provider: Arc<dyn LlmProvider> = Arc::from(creds.build_provider());
     let registry = Arc::new(build_registry());
     let tool_defs = registry.tool_defs();
     let max_ctx = context_limit(&creds.model);
@@ -861,6 +1057,7 @@ pub async fn run(creds: Credentials) -> Result<()> {
     show_splash(&mut terminal, &mut key_rx, &creds.provider, &creds.model).await?;
 
     let mut app = App::new();
+    app.personas = AgentPersona::discover();
     let mut messages: Vec<Message> = Vec::new();
     let mut stream_rx: Option<mpsc::Receiver<DisplayEvent>> = None;
     let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -908,10 +1105,20 @@ pub async fn run(creds: Credentials) -> Result<()> {
                 // Scroll (always available)
                 match key.code {
                     KeyCode::Up if !app.spinning && stream_rx.is_none() => {
-                        let suggestions = slash_suggestions(&app.input);
-                        if app.input.starts_with('/') && !suggestions.is_empty() {
-                            // navigate suggestion popup upward
-                            let len = suggestions.len();
+                        let slash_sugg = slash_suggestions(&app.input);
+                        let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
+                            at_suggestions(&app.input[1..], &app.personas)
+                        } else {
+                            vec![]
+                        };
+                        if app.input.starts_with('/') && !slash_sugg.is_empty() {
+                            let len = slash_sugg.len();
+                            app.suggest_idx = Some(match app.suggest_idx {
+                                None | Some(0) => len - 1,
+                                Some(i) => i - 1,
+                            });
+                        } else if app.input.starts_with('@') && !at_sugg.is_empty() {
+                            let len = at_sugg.len();
                             app.suggest_idx = Some(match app.suggest_idx {
                                 None | Some(0) => len - 1,
                                 Some(i) => i - 1,
@@ -930,10 +1137,20 @@ pub async fn run(creds: Credentials) -> Result<()> {
                         continue 'main;
                     }
                     KeyCode::Down if !app.spinning && stream_rx.is_none() => {
-                        let suggestions = slash_suggestions(&app.input);
-                        if app.input.starts_with('/') && !suggestions.is_empty() {
-                            // navigate suggestion popup downward
-                            let len = suggestions.len();
+                        let slash_sugg = slash_suggestions(&app.input);
+                        let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
+                            at_suggestions(&app.input[1..], &app.personas)
+                        } else {
+                            vec![]
+                        };
+                        if app.input.starts_with('/') && !slash_sugg.is_empty() {
+                            let len = slash_sugg.len();
+                            app.suggest_idx = Some(match app.suggest_idx {
+                                None => 0,
+                                Some(i) => (i + 1) % len,
+                            });
+                        } else if app.input.starts_with('@') && !at_sugg.is_empty() {
+                            let len = at_sugg.len();
                             app.suggest_idx = Some(match app.suggest_idx {
                                 None => 0,
                                 Some(i) => (i + 1) % len,
@@ -983,12 +1200,22 @@ pub async fn run(creds: Credentials) -> Result<()> {
                 match key.code {
                     // Tab: autocomplete selected suggestion
                     KeyCode::Tab => {
-                        let suggestions = slash_suggestions(&app.input);
-                        if !suggestions.is_empty() {
-                            let idx = app.suggest_idx.unwrap_or(0);
-                            app.input = suggestions[idx].0.to_string();
-                            app.cursor = app.input.len();
-                            app.suggest_idx = None;
+                        if app.input.starts_with('@') && !app.input.contains(' ') {
+                            let at_sugg = at_suggestions(&app.input[1..], &app.personas);
+                            if !at_sugg.is_empty() {
+                                let idx = app.suggest_idx.unwrap_or(0);
+                                app.input = format!("@{}", at_sugg[idx].0);
+                                app.cursor = app.input.len();
+                                app.suggest_idx = None;
+                            }
+                        } else {
+                            let suggestions = slash_suggestions(&app.input);
+                            if !suggestions.is_empty() {
+                                let idx = app.suggest_idx.unwrap_or(0);
+                                app.input = suggestions[idx].0.to_string();
+                                app.cursor = app.input.len();
+                                app.suggest_idx = None;
+                            }
                         }
                         continue 'main;
                     }
@@ -1032,14 +1259,25 @@ pub async fn run(creds: Credentials) -> Result<()> {
                     }
 
                     KeyCode::Enter => {
-                        // If a suggestion is selected, complete it instead of submitting
-                        let suggestions = slash_suggestions(&app.input);
-                        if !suggestions.is_empty() && app.suggest_idx.is_some() {
+                        // If a slash suggestion is selected, complete it instead of submitting
+                        let slash_sugg = slash_suggestions(&app.input);
+                        if !slash_sugg.is_empty() && app.suggest_idx.is_some() {
                             let idx = app.suggest_idx.unwrap();
-                            app.input = suggestions[idx].0.to_string();
+                            app.input = slash_sugg[idx].0.to_string();
                             app.cursor = app.input.len();
                             app.suggest_idx = None;
                             continue 'main;
+                        }
+                        // If an @<name> suggestion is selected, complete it
+                        if app.input.starts_with('@') && !app.input.contains(' ') {
+                            let at_sugg = at_suggestions(&app.input[1..], &app.personas);
+                            if !at_sugg.is_empty() && app.suggest_idx.is_some() {
+                                let idx = app.suggest_idx.unwrap();
+                                app.input = format!("@{}", at_sugg[idx].0);
+                                app.cursor = app.input.len();
+                                app.suggest_idx = None;
+                                continue 'main;
+                            }
                         }
                         app.suggest_idx = None;
                         let input = app.input.trim().to_string();
@@ -1051,6 +1289,55 @@ pub async fn run(creds: Credentials) -> Result<()> {
                         app.auto_scroll = true;
                         app.scroll = u16::MAX;
 
+                        // @<name> alone — activate persona
+                        if input.starts_with('@') && !input.contains(' ') {
+                            let name = input[1..].trim();
+                            // Rediscover if personas not loaded
+                            if app.personas.is_empty() {
+                                app.personas = AgentPersona::discover();
+                            }
+                            if let Some(pos) = app.personas.iter().position(|p| p.name == name) {
+                                let persona = app.personas.remove(pos);
+                                // Optionally switch provider
+                                if persona.model.is_some() || persona.provider.is_some() {
+                                    let new_model = persona.model.as_deref().unwrap_or(&creds.model);
+                                    let new_prov = persona.provider.as_deref().unwrap_or(&creds.provider);
+                                    let new_creds = Credentials {
+                                        provider: new_prov.to_string(),
+                                        model: new_model.to_string(),
+                                        ..creds.clone()
+                                    };
+                                    provider = Arc::from(new_creds.build_provider());
+                                    app.push(ChatMsg::Info(format!(
+                                        "switched model to {} / {}",
+                                        new_prov, new_model
+                                    )));
+                                }
+                                app.push(ChatMsg::Info(format!(
+                                    "switched to persona '@{}'",
+                                    persona.name
+                                )));
+                                app.personas.insert(pos, persona);
+                                // Activate — re-borrow by index
+                                let persona_name = app.personas[pos].name.clone();
+                                app.active_persona = Some(AgentPersona {
+                                    name: app.personas[pos].name.clone(),
+                                    description: app.personas[pos].description.clone(),
+                                    model: app.personas[pos].model.clone(),
+                                    provider: app.personas[pos].provider.clone(),
+                                    system_prompt: app.personas[pos].system_prompt.clone(),
+                                    path: app.personas[pos].path.clone(),
+                                });
+                                let _ = persona_name; // used above
+                            } else {
+                                app.push(ChatMsg::Error(format!(
+                                    "persona '@{}' not found — use /agents list to see available personas",
+                                    name
+                                )));
+                            }
+                            continue 'main;
+                        }
+
                         match input.as_str() {
                             "/quit" => break 'main,
                             "/clear" => {
@@ -1061,14 +1348,39 @@ pub async fn run(creds: Credentials) -> Result<()> {
                             }
                             "/tools"  => cmd_tools(&mut app, &registry),
                             "/skills" => cmd_skills(&mut app, &krabs_config.skills),
-                            "/mcp"    => cmd_mcp(&mut app).await,
+                            s if s == "/mcp" || s.starts_with("/mcp ") => {
+                                let mcp_args = s.strip_prefix("/mcp").unwrap_or("").trim();
+                                cmd_mcp(&mut app, mcp_args).await;
+                            }
                             "/usage"  => cmd_usage(&mut app, max_ctx),
+                            s if s == "/agents" || s.starts_with("/agents ") => {
+                                let args = s.strip_prefix("/agents").unwrap_or("").trim();
+                                cmd_agents(&mut app, args);
+                            }
                             s if s == "/hooks" || s.starts_with("/hooks ") => {
                                 let args = s.strip_prefix("/hooks").unwrap_or("").trim();
                                 cmd_hooks(&mut app, args);
                             }
                             _ => {
                                 app.push(ChatMsg::User(input.clone()));
+
+                                // Build effective messages: prepend system prompt if persona active
+                                let mut turn_messages = messages.clone();
+                                if let Some(ref persona) = app.active_persona {
+                                    let base_prompt = format!(
+                                        "You are Krabs, an agentic assistant.\n\n---\n\n{}",
+                                        persona.system_prompt
+                                    );
+                                    // Only prepend if no system message exists yet
+                                    let has_system = turn_messages
+                                        .first()
+                                        .map(|m| matches!(m.role, Role::System))
+                                        .unwrap_or(false);
+                                    if !has_system {
+                                        turn_messages.insert(0, Message::system(&base_prompt));
+                                    }
+                                }
+                                turn_messages.push(Message::user(&input));
                                 messages.push(Message::user(&input));
                                 app.spinning = true;
 
@@ -1076,7 +1388,7 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                 stream_rx = Some(rx);
 
                                 turn_handle = Some(tokio::spawn(run_turn(
-                                    messages.clone(),
+                                    turn_messages,
                                     Arc::clone(&provider),
                                     tool_defs.clone(),
                                     Arc::clone(&registry),

@@ -1,6 +1,7 @@
 use crate::config::KrabsConfig;
 use crate::hooks::hook::{HookEvent, HookOutput, ToolUseDecision};
 use crate::hooks::registry::HookRegistry;
+use crate::mcp::mcp::McpRegistry;
 use crate::memory::MemoryStore;
 use crate::permissions::PermissionGuard;
 use crate::providers::provider::{LlmProvider, LlmResponse, Message, Role, StreamChunk};
@@ -47,6 +48,7 @@ pub struct KrabsAgentBuilder {
     system_prompt: String,
     skills: Option<Arc<SkillRegistry>>,
     hooks: HookRegistry,
+    mcp_registry: Option<McpRegistry>,
 }
 
 impl KrabsAgentBuilder {
@@ -60,6 +62,7 @@ impl KrabsAgentBuilder {
             system_prompt: String::new(),
             skills: None,
             hooks: HookRegistry::default(),
+            mcp_registry: None,
         }
     }
 
@@ -93,6 +96,23 @@ impl KrabsAgentBuilder {
     pub fn hook(mut self, hook: Arc<dyn crate::hooks::hook::Hook>) -> Self {
         self.hooks.register(hook);
         self
+    }
+
+    pub fn with_mcp_registry(mut self, registry: McpRegistry) -> Self {
+        self.mcp_registry = Some(registry);
+        self
+    }
+
+    /// Build the agent, connecting MCP servers and registering their tools.
+    /// Use this when MCP is configured; it is async to allow server connections.
+    pub async fn build_async(mut self) -> Arc<KrabsAgent> {
+        if let Some(mcp) = self.mcp_registry.take() {
+            let live = mcp.connect_all().await;
+            for tool in live.tools_for_all().await {
+                self.registry.register(Arc::from(tool));
+            }
+        }
+        self.build()
     }
 
     pub fn build(self) -> Arc<KrabsAgent> {
