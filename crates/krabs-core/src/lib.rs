@@ -11,6 +11,8 @@ pub mod skills;
 pub mod tools;
 
 pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
+pub use permissions::PermissionGuard;
+pub use agents::base_agent::BaseAgent;
 pub use agents::persona::AgentPersona;
 pub use config::config::{KrabsConfig, SkillsConfig};
 pub use config::credentials::Credentials;
@@ -26,6 +28,8 @@ pub use providers::provider::{
 pub use providers::{AnthropicProvider, GeminiProvider, OpenAiProvider};
 pub use skills::{FsSkill, SkillRegistry};
 pub use tools::bash::BashTool;
+pub use tools::delegate::DelegateTool;
+pub use tools::dispatch::DispatchTool;
 pub use tools::glob::{GlobTool, GrepTool};
 pub use tools::read::ReadTool;
 pub use tools::registry::ToolRegistry;

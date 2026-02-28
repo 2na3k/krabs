@@ -155,8 +155,13 @@ impl KrabsAgent {
     }
 
     /// Sync skills from disk then return the full system prompt for this turn.
+    ///
+    /// The immutable base (SOUL + SYSTEM_PROMPT) is always prepended and cannot
+    /// be overridden by any caller-supplied system prompt.
     async fn current_system_prompt(&self) -> String {
-        match &self.skills {
+        let base = crate::prompts::base_system_prompt();
+
+        let extension = match &self.skills {
             None => self.system_prompt.clone(),
             Some(registry) => {
                 registry.sync().await;
@@ -167,6 +172,12 @@ impl KrabsAgent {
                     format!("{}\n\n{}", self.system_prompt, section)
                 }
             }
+        };
+
+        if extension.is_empty() {
+            base
+        } else {
+            format!("{}\n\n{}", base, extension)
         }
     }
 
@@ -294,7 +305,11 @@ impl KrabsAgent {
         for turn in 0..self.config.max_turns {
             let system_prompt = self.current_system_prompt().await;
             if !system_prompt.is_empty() {
-                if messages.first().map(|m| matches!(m.role, Role::System)).unwrap_or(false) {
+                if messages
+                    .first()
+                    .map(|m| matches!(m.role, Role::System))
+                    .unwrap_or(false)
+                {
                     messages[0] = Message::system(&system_prompt);
                 } else {
                     messages.insert(0, Message::system(&system_prompt));
@@ -411,7 +426,8 @@ impl KrabsAgent {
                                     } else {
                                         result.content
                                     };
-                                    messages.push(Message::tool_result(&content, &call.id, &call.name));
+                                    messages
+                                        .push(Message::tool_result(&content, &call.id, &call.name));
                                 }
                                 Err(e) => {
                                     self.hooks
@@ -422,7 +438,11 @@ impl KrabsAgent {
                                             tool_use_id: call.id.clone(),
                                         })
                                         .await;
-                                    messages.push(Message::tool_result(e.to_string(), &call.id, &call.name));
+                                    messages.push(Message::tool_result(
+                                        e.to_string(),
+                                        &call.id,
+                                        &call.name,
+                                    ));
                                 }
                             }
                         }
@@ -590,7 +610,9 @@ impl Agent for KrabsAgent {
                                         } else {
                                             result.content
                                         };
-                                        messages.push(Message::tool_result(&content, &call.id, &call.name));
+                                        messages.push(Message::tool_result(
+                                            &content, &call.id, &call.name,
+                                        ));
                                     }
                                     Err(e) => {
                                         self.hooks
@@ -601,8 +623,11 @@ impl Agent for KrabsAgent {
                                                 tool_use_id: call.id.clone(),
                                             })
                                             .await;
-                                        messages
-                                            .push(Message::tool_result(e.to_string(), &call.id, &call.name));
+                                        messages.push(Message::tool_result(
+                                            e.to_string(),
+                                            &call.id,
+                                            &call.name,
+                                        ));
                                     }
                                 }
                             }

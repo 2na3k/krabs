@@ -4,10 +4,12 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use crate::user_input::{InputMode, UserInputRequest, UserInputTool};
 use krabs_core::{
-    skills::loader::SkillLoader, AgentPersona, BashTool, Credentials, GlobTool, GrepTool,
-    HookConfig, HookEntry, KrabsConfig, LlmProvider, McpRegistry, McpServer, Message, ReadTool,
-    Role, SkillsConfig, StreamChunk, TokenUsage, ToolCall, ToolRegistry, WriteTool,
+    skills::loader::SkillLoader, AgentPersona, BaseAgent, BashTool, Credentials, DelegateTool,
+    DispatchTool, GlobTool, GrepTool, HookConfig, HookEntry, KrabsConfig, LlmProvider,
+    McpRegistry, McpServer, Message, ReadTool, Role, SkillsConfig, StreamChunk, TokenUsage,
+    ToolCall, ToolRegistry, WriteTool,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -176,6 +178,8 @@ enum DisplayEvent {
         args: String,
         respond: oneshot::Sender<bool>,
     },
+    /// Sent by `ask_user` tool; TUI renders a choice popup and blocks the agent.
+    UserInput(UserInputRequest),
     ToolCallStart(ToolCall),
     ToolResultEnd(String),
     TurnUsage(TokenUsage),
@@ -188,6 +192,23 @@ struct PendingPermission {
     tool_name: String,
     args: String,
     respond: oneshot::Sender<bool>,
+}
+
+/// Active user-input prompt rendered as a TUI popup.
+struct PendingUserInput {
+    mode: InputMode,
+    question: String,
+    /// Choices shown to the user (options + "custom…" appended).
+    options: Vec<String>,
+    /// For ChooseMany: which indices are checked.
+    selected: Vec<bool>,
+    /// Highlighted / focused index.
+    cursor: usize,
+    /// True when the user is typing a custom free-text answer.
+    custom_mode: bool,
+    custom_text: String,
+    custom_cursor: usize,
+    respond: oneshot::Sender<String>,
 }
 
 // ── app state ────────────────────────────────────────────────────────────────
@@ -215,6 +236,8 @@ struct App {
     approved_tools: HashSet<String>,
     /// Active permission prompt waiting for y / a / n keypress.
     pending_permission: Option<PendingPermission>,
+    /// Active user-input popup waiting for the user to select / confirm.
+    pending_user_input: Option<PendingUserInput>,
 }
 
 impl App {
@@ -236,6 +259,7 @@ impl App {
             personas: Vec::new(),
             approved_tools: HashSet::new(),
             pending_permission: None,
+            pending_user_input: None,
             system_prompt_text: String::new(),
             persona_text: String::new(),
             tools_text: String::new(),
@@ -388,6 +412,30 @@ fn build_agent(
             tool_registry.register(t);
         }
     }
+    // Register orchestration tools so the agent can spawn specialised sub-agents.
+    tool_registry.register(Arc::new(DelegateTool::new(
+        config.clone(),
+        Arc::clone(&provider),
+        tool_registry.clone(),
+        krabs_core::PermissionGuard::new(),
+    )));
+    tool_registry.register(Arc::new(DispatchTool::new(
+        config.clone(),
+        Arc::clone(&provider),
+        tool_registry.clone(),
+        krabs_core::PermissionGuard::new(),
+    )));
+    // Register the ask_user tool: a dedicated channel forwards requests to the
+    // TUI event loop as DisplayEvent::UserInput, blocking the agent until the
+    // user confirms their choice in the popup.
+    let (ui_tx, mut ui_rx) = mpsc::channel::<UserInputRequest>(4);
+    let fwd_tx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(req) = ui_rx.recv().await {
+            let _ = fwd_tx.send(DisplayEvent::UserInput(req)).await;
+        }
+    });
+    tool_registry.register(Arc::new(UserInputTool::new(ui_tx)));
     krabs_core::KrabsAgentBuilder::new(config.clone(), provider)
         .registry(tool_registry)
         .system_prompt(system_prompt)
@@ -470,15 +518,23 @@ fn cmd_agents(app: &mut App, args: &str) {
     let parts: Vec<&str> = args.split_whitespace().collect();
     match parts.as_slice() {
         [] | ["list"] => {
+            // ── built-in base agents ──────────────────────────────────────────
+            let base = BaseAgent::all();
+            app.push(ChatMsg::Info(format!("{} built-in agent(s):", base.len())));
+            for agent in base {
+                app.push(ChatMsg::Info(format!("  @{:<20}  (built-in)", agent.name())));
+            }
+
+            // ── project personas (discovered from ./krabs/agents/) ────────────
             let personas = AgentPersona::discover();
             app.personas = personas;
             if app.personas.is_empty() {
                 app.push(ChatMsg::Info(
-                    "no agent personas found — add markdown files to ./krabs/agents/".into(),
+                    "no project personas found — add markdown files to ./krabs/agents/".into(),
                 ));
             } else {
                 let lines: Vec<String> = {
-                    let mut v = vec![format!("{} persona(s):", app.personas.len())];
+                    let mut v = vec![format!("{} project persona(s):", app.personas.len())];
                     for p in &app.personas {
                         let desc = p.description.as_deref().unwrap_or("");
                         v.push(format!("  @{:<20}  {}", p.name, desc));
@@ -580,7 +636,10 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
             Span::styled(&info.tools, Style::default().fg(Color::White)),
         ]),
         Line::from({
-            let mut spans = vec![Span::styled("  ctx     ", Style::default().fg(Color::DarkGray))];
+            let mut spans = vec![Span::styled(
+                "  ctx     ",
+                Style::default().fg(Color::DarkGray),
+            )];
             spans.extend(ctx_spans);
             spans
         }),
@@ -768,6 +827,79 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
 
         frame.render_widget(ratatui::widgets::Clear, pop_rect);
         frame.render_widget(perm_widget, pop_rect);
+    }
+
+    // ── user-input popup ─────────────────────────────────────────────────────
+    if let Some(ref ui) = app.pending_user_input {
+        let pop_w = (area.width * 3 / 4).clamp(44, 76);
+        let n_opts = ui.options.len() as u16; // includes "custom…"
+        let pop_h = 4 + n_opts + if ui.custom_mode { 2 } else { 1 };
+        let pop_x = area.x + (area.width.saturating_sub(pop_w)) / 2;
+        let pop_y = area.y + (area.height.saturating_sub(pop_h)) / 2;
+        let pop_rect = ratatui::layout::Rect::new(pop_x, pop_y, pop_w, pop_h);
+
+        let mut lines: Vec<Line> = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                format!("  {}", ui.question),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+        ];
+
+        for (i, opt) in ui.options.iter().enumerate() {
+            let focused = i == ui.cursor;
+            let prefix = match ui.mode {
+                InputMode::ChooseOne => {
+                    if focused { "  ● " } else { "  ○ " }
+                }
+                InputMode::ChooseMany => {
+                    if ui.selected[i] { "  [x] " } else { "  [ ] " }
+                }
+            };
+            let style = if focused {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            // Last option is always the custom placeholder
+            let label = if i == ui.options.len() - 1 && ui.custom_mode {
+                format!("{}{}_", prefix, ui.custom_text) // blinking cursor sim
+            } else {
+                format!("{}{}", prefix, opt)
+            };
+            lines.push(Line::from(Span::styled(label, style)));
+        }
+
+        lines.push(Line::raw(""));
+        let hint = match ui.mode {
+            InputMode::ChooseOne => "  ↑↓ move   enter select   esc cancel",
+            InputMode::ChooseMany => "  ↑↓ move   space toggle   enter confirm   esc cancel",
+        };
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let (border_color, title) = match ui.mode {
+            InputMode::ChooseOne => (Color::Cyan, " agent question — choose one "),
+            InputMode::ChooseMany => (Color::Magenta, " agent question — choose many "),
+        };
+
+        let popup = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(border_color)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        );
+
+        frame.render_widget(ratatui::widgets::Clear, pop_rect);
+        frame.render_widget(popup, pop_rect);
     }
 
     // @<name> suggestion popup
@@ -1083,9 +1215,7 @@ fn cmd_usage(app: &mut App, max_ctx: u32, skills_config: &SkillsConfig) {
     let t_free = max_ctx.saturating_sub(used);
 
     // Build per-category bar segments (proportional to max_ctx)
-    let seg = |tok: u32| -> usize {
-        ((tok as f32 / max_ctx as f32) * BAR as f32).round() as usize
-    };
+    let seg = |tok: u32| -> usize { ((tok as f32 / max_ctx as f32) * BAR as f32).round() as usize };
 
     let segs = [
         (seg(t_system), 'S', Color::Green),
@@ -1097,7 +1227,11 @@ fn cmd_usage(app: &mut App, max_ctx: u32, skills_config: &SkillsConfig) {
         (seg(t_free), 'F', Color::DarkGray),
     ];
 
-    let header = format!("context usage  {pct:.1}%  ({} / {} tokens)", fmt_k(used), fmt_k(max_ctx));
+    let header = format!(
+        "context usage  {pct:.1}%  ({} / {} tokens)",
+        fmt_k(used),
+        fmt_k(max_ctx)
+    );
     app.push(ChatMsg::Info(header));
     app.push(ChatMsg::Info(String::new()));
 
@@ -1371,6 +1505,118 @@ pub async fn run(creds: Credentials) -> Result<()> {
                         continue 'main;
                     }
                     _ => {}
+                }
+
+                // ── User-input popup ──────────────────────────────────────────
+                if app.pending_user_input.is_some() {
+                    let ui = app.pending_user_input.as_mut().unwrap();
+                    let last = ui.options.len() - 1; // index of the "custom…" entry
+
+                    if ui.custom_mode {
+                        // Typing a custom answer
+                        match key.code {
+                            KeyCode::Char(c) => {
+                                ui.custom_text.insert(ui.custom_cursor, c);
+                                ui.custom_cursor += c.len_utf8();
+                            }
+                            KeyCode::Backspace => {
+                                if ui.custom_cursor > 0 {
+                                    let c = ui.custom_text.remove(ui.custom_cursor - 1);
+                                    ui.custom_cursor -= c.len_utf8();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let text = ui.custom_text.trim().to_string();
+                                if text.is_empty() {
+                                    // Back out of custom mode
+                                    ui.custom_mode = false;
+                                } else {
+                                    let answer = text;
+                                    if let Some(p) = app.pending_user_input.take() {
+                                        app.push(ChatMsg::Info(format!("  ↳ {answer}")));
+                                        let _ = p.respond.send(answer);
+                                        app.spinning = true;
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                ui.custom_mode = false;
+                                ui.custom_text.clear();
+                                ui.custom_cursor = 0;
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Up => {
+                                if ui.cursor > 0 { ui.cursor -= 1; }
+                            }
+                            KeyCode::Down => {
+                                if ui.cursor < last { ui.cursor += 1; }
+                            }
+                            KeyCode::Char(' ') if ui.mode == InputMode::ChooseMany => {
+                                if ui.cursor == last {
+                                    // Space on custom → enter custom mode
+                                    ui.custom_mode = true;
+                                } else {
+                                    ui.selected[ui.cursor] = !ui.selected[ui.cursor];
+                                }
+                            }
+                            KeyCode::Enter => {
+                                match ui.mode {
+                                    InputMode::ChooseOne => {
+                                        if ui.cursor == last {
+                                            ui.custom_mode = true;
+                                        } else {
+                                            let answer = ui.options[ui.cursor].clone();
+                                            if let Some(p) = app.pending_user_input.take() {
+                                                app.push(ChatMsg::Info(format!("  ↳ {answer}")));
+                                                let _ = p.respond.send(answer);
+                                                app.spinning = true;
+                                            }
+                                        }
+                                    }
+                                    InputMode::ChooseMany => {
+                                        if ui.cursor == last && !ui.custom_mode {
+                                            ui.custom_mode = true;
+                                        } else {
+                                            // Collect selected options + custom text
+                                            let mut parts: Vec<String> = ui
+                                                .options[..last]
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(i, _)| ui.selected[*i])
+                                                .map(|(_, o)| o.clone())
+                                                .collect();
+                                            if !ui.custom_text.trim().is_empty() {
+                                                parts.push(ui.custom_text.trim().to_string());
+                                            }
+                                            if parts.is_empty() {
+                                                // Nothing selected — require at least one
+                                            } else {
+                                                let answer = parts.join(", ");
+                                                if let Some(p) = app.pending_user_input.take() {
+                                                    app.push(ChatMsg::Info(format!("  ↳ {answer}")));
+                                                    let _ = p.respond.send(answer);
+                                                    app.spinning = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                // Cancel: send back an empty string and let the agent handle it
+                                if let Some(p) = app.pending_user_input.take() {
+                                    app.push(ChatMsg::Info("  ↳ (cancelled)".into()));
+                                    let _ = p.respond.send(String::new());
+                                    app.spinning = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue 'main;
                 }
 
                 // ── Permission prompt: intercept y / a / n ────────────────────
@@ -1662,6 +1908,24 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                 respond,
                             });
                         }
+                    }
+                    Some(DisplayEvent::UserInput(req)) => {
+                        app.spinning = false;
+                        // Build the options list: user options + "custom…" sentinel
+                        let mut options = req.options.clone();
+                        options.push("custom…".into());
+                        let n = options.len();
+                        app.pending_user_input = Some(PendingUserInput {
+                            mode: req.mode,
+                            question: req.question,
+                            options,
+                            selected: vec![false; n],
+                            cursor: 0,
+                            custom_mode: false,
+                            custom_text: String::new(),
+                            custom_cursor: 0,
+                            respond: req.respond,
+                        });
                     }
                     Some(DisplayEvent::ToolCallStart(call)) => {
                         app.spinning = false;

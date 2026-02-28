@@ -1,5 +1,17 @@
 use crate::tools::tool::ToolDef;
 
+/// Immutable soul / identity layer — embedded at compile time.
+pub const SOUL: &str = include_str!("system/SOUL.md");
+
+/// Immutable operational instructions — embedded at compile time.
+pub const SYSTEM_PROMPT_BASE: &str = include_str!("system/SYSTEM_PROMPT.md");
+
+/// Returns the immutable base system prompt (SOUL + SYSTEM_PROMPT).
+/// This is always prepended to any user-provided prompt and must not be overridden.
+pub fn base_system_prompt() -> String {
+    format!("{}\n\n{}", SOUL, SYSTEM_PROMPT_BASE)
+}
+
 pub struct SystemPromptBuilder {
     base: String,
     sections: Vec<String>,
