@@ -14,7 +14,7 @@ pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
 pub use permissions::PermissionGuard;
 pub use agents::base_agent::BaseAgent;
 pub use agents::persona::AgentPersona;
-pub use config::config::{KrabsConfig, SkillsConfig};
+pub use config::config::{CustomModelEntry, KrabsConfig, SkillsConfig};
 pub use config::credentials::Credentials;
 pub use hooks::{
     Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, ToolUseDecision,

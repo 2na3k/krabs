@@ -1,15 +1,15 @@
+use crate::user_input::{InputMode, UserInputRequest, UserInputTool};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use crate::user_input::{InputMode, UserInputRequest, UserInputTool};
 use krabs_core::{
-    skills::loader::SkillLoader, AgentPersona, BaseAgent, BashTool, Credentials, DelegateTool,
-    DispatchTool, GlobTool, GrepTool, HookConfig, HookEntry, KrabsConfig, LlmProvider,
-    McpRegistry, McpServer, Message, ReadTool, Role, SkillsConfig, StreamChunk, TokenUsage,
-    ToolCall, ToolRegistry, WriteTool,
+    skills::loader::SkillLoader, AgentPersona, BaseAgent, BashTool, Credentials, CustomModelEntry,
+    DelegateTool, DispatchTool, GlobTool, GrepTool, HookConfig, HookEntry, KrabsConfig,
+    LlmProvider, McpRegistry, McpServer, Message, ReadTool, Role, SkillsConfig, StreamChunk,
+    TokenUsage, ToolCall, ToolRegistry, WriteTool,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -38,9 +38,43 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "list/add/remove hooks  usage: /hooks [list|add|remove]",
     ),
     ("/agents", "list agent personas  |  use @<name> to activate"),
+    (
+        "/models",
+        "list or switch models  usage: /models [<model> | <provider> <model>]",
+    ),
     ("/usage", "show context window usage"),
     ("/clear", "clear screen and conversation"),
     ("/quit", "exit Krabs"),
+];
+
+/// Well-known models grouped by provider. Used by `/models` for display and tab-completion.
+const KNOWN_MODELS: &[(&str, &[&str])] = &[
+    (
+        "anthropic",
+        &[
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ],
+    ),
+    (
+        "openai",
+        &["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o1", "o3-mini"],
+    ),
+    (
+        "gemini",
+        &[
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ],
+    ),
+    (
+        "
+        ",
+        &["llama3.2", "mistral", "codestral", "qwen2.5-coder"],
+    ),
 ];
 
 fn context_limit(model: &str) -> u32 {
@@ -522,7 +556,10 @@ fn cmd_agents(app: &mut App, args: &str) {
             let base = BaseAgent::all();
             app.push(ChatMsg::Info(format!("{} built-in agent(s):", base.len())));
             for agent in base {
-                app.push(ChatMsg::Info(format!("  @{:<20}  (built-in)", agent.name())));
+                app.push(ChatMsg::Info(format!(
+                    "  @{:<20}  (built-in)",
+                    agent.name()
+                )));
             }
 
             // ── project personas (discovered from ./krabs/agents/) ────────────
@@ -842,7 +879,9 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
             Line::raw(""),
             Line::from(Span::styled(
                 format!("  {}", ui.question),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::raw(""),
         ];
@@ -851,14 +890,24 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
             let focused = i == ui.cursor;
             let prefix = match ui.mode {
                 InputMode::ChooseOne => {
-                    if focused { "  ● " } else { "  ○ " }
+                    if focused {
+                        "  ● "
+                    } else {
+                        "  ○ "
+                    }
                 }
                 InputMode::ChooseMany => {
-                    if ui.selected[i] { "  [x] " } else { "  [ ] " }
+                    if ui.selected[i] {
+                        "  [x] "
+                    } else {
+                        "  [ ] "
+                    }
                 }
             };
             let style = if focused {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -952,6 +1001,113 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
 }
 
 // ── slash command helpers ────────────────────────────────────────────────────
+
+/// /models                    — list known + custom models
+/// /models <name|model>       — switch by custom entry name or model id (keep provider)
+/// /models <provider> <model> — switch provider and model
+fn cmd_models(
+    app: &mut App,
+    args: &str,
+    creds: &mut Credentials,
+    provider: &mut Arc<dyn LlmProvider>,
+    info: &mut InfoBar,
+    max_ctx: &mut u32,
+    custom_models: &[CustomModelEntry],
+) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.as_slice() {
+        // /models — list
+        [] => {
+            app.push(ChatMsg::Info(format!(
+                "current: {}  {}  ({})",
+                creds.provider, creds.model, creds.base_url
+            )));
+            app.push(ChatMsg::Info(String::new()));
+
+            // Built-in known models
+            for (prov, models) in KNOWN_MODELS {
+                app.push(ChatMsg::Info(format!("  {}:", prov)));
+                for m in *models {
+                    let active = *prov == creds.provider && *m == creds.model;
+                    let marker = if active { " ◀" } else { "" };
+                    app.push(ChatMsg::Info(format!("    {}{}", m, marker)));
+                }
+            }
+
+            // Custom models from config
+            if !custom_models.is_empty() {
+                app.push(ChatMsg::Info(String::new()));
+                app.push(ChatMsg::Info("  custom (from config):".into()));
+                for entry in custom_models {
+                    let active = entry.provider == creds.provider
+                        && entry.model == creds.model
+                        && entry.base_url == creds.base_url;
+                    let marker = if active { " ◀" } else { "" };
+                    app.push(ChatMsg::Info(format!(
+                        "    {:<20}  {}  {}  {}{}",
+                        entry.name, entry.provider, entry.model, entry.base_url, marker
+                    )));
+                }
+            }
+
+            app.push(ChatMsg::Info(String::new()));
+            app.push(ChatMsg::Info(
+                "  usage: /models <name|model>  |  /models <provider> <model>".into(),
+            ));
+        }
+
+        // /models <name|model> — check custom entries first, then fall back to model-id switch
+        [name_or_model] => {
+            if let Some(entry) = custom_models.iter().find(|e| e.name == *name_or_model) {
+                // Matched a named custom entry — apply all its fields
+                creds.provider = entry.provider.clone();
+                creds.model = entry.model.clone();
+                creds.base_url = entry.base_url.clone();
+                if !entry.api_key.is_empty() {
+                    creds.api_key = entry.api_key.clone();
+                }
+                *provider = Arc::from(creds.build_provider());
+                *max_ctx = context_limit(&creds.model);
+                info.provider = creds.provider.clone();
+                info.model = creds.model.clone();
+                app.push(ChatMsg::Info(format!(
+                    "switched to custom model '{}' → {}  {}  ({})",
+                    entry.name, creds.provider, creds.model, creds.base_url
+                )));
+            } else {
+                // Treat as a bare model id — keep current provider and base_url
+                creds.model = name_or_model.to_string();
+                *provider = Arc::from(creds.build_provider());
+                *max_ctx = context_limit(&creds.model);
+                info.model = creds.model.clone();
+                app.push(ChatMsg::Info(format!(
+                    "switched model → {}  {}",
+                    creds.provider, creds.model
+                )));
+            }
+        }
+
+        // /models <provider> <model>
+        [prov, model] => {
+            creds.provider = prov.to_string();
+            creds.model = model.to_string();
+            *provider = Arc::from(creds.build_provider());
+            *max_ctx = context_limit(&creds.model);
+            info.provider = creds.provider.clone();
+            info.model = creds.model.clone();
+            app.push(ChatMsg::Info(format!(
+                "switched → {}  {}",
+                creds.provider, creds.model
+            )));
+        }
+
+        _ => {
+            app.push(ChatMsg::Error(
+                "usage: /models [<name|model> | <provider> <model>]".into(),
+            ));
+        }
+    }
+}
 
 fn cmd_tools(app: &mut App, registry: &ToolRegistry) {
     app.push(ChatMsg::Info("available tools:".into()));
@@ -1360,13 +1516,14 @@ async fn show_splash(
 
 pub async fn run(creds: Credentials) -> Result<()> {
     let krabs_config = KrabsConfig::load().unwrap_or_default();
+    let mut creds = creds;
     let mut provider: Arc<dyn LlmProvider> = Arc::from(creds.build_provider());
     let registry = Arc::new(build_registry());
-    let max_ctx = context_limit(&creds.model);
+    let mut max_ctx = context_limit(&creds.model);
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".into());
-    let info = InfoBar {
+    let mut info = InfoBar {
         provider: creds.provider.clone(),
         model: creds.model.clone(),
         cwd,
@@ -1824,6 +1981,14 @@ pub async fn run(creds: Credentials) -> Result<()> {
                             s if s == "/hooks" || s.starts_with("/hooks ") => {
                                 let args = s.strip_prefix("/hooks").unwrap_or("").trim();
                                 cmd_hooks(&mut app, args);
+                            }
+                            s if s == "/models" || s.starts_with("/models ") => {
+                                let args = s.strip_prefix("/models").unwrap_or("").trim();
+                                cmd_models(
+                                    &mut app, args, &mut creds,
+                                    &mut provider, &mut info, &mut max_ctx,
+                                    &krabs_config.custom_models,
+                                );
                             }
                             _ => {
                                 app.push(ChatMsg::User(input.clone()));

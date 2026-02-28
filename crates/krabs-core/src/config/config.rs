@@ -23,6 +23,42 @@ impl Default for SkillsConfig {
     }
 }
 
+/// A named custom model entry pointing at an OpenAI-compatible endpoint.
+///
+/// Example in `~/.krabs/config.json` or `.krabs.json`:
+/// ```json
+/// {
+///   "custom_models": [
+///     {
+///       "name": "llama3.2-local",
+///       "provider": "openai",
+///       "base_url": "http://localhost:8080/v1",
+///       "api_key": "",
+///       "model": "llama3.2"
+///     }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomModelEntry {
+    /// Display name shown in `/models` output.
+    pub name: String,
+    /// Provider type: `"openai"` | `"anthropic"` | `"gemini"`. Defaults to `"openai"`.
+    #[serde(default = "default_entry_provider")]
+    pub provider: String,
+    /// Base URL for the API endpoint (OpenAI-compatible servers, llama.cpp, vLLM, etc.).
+    pub base_url: String,
+    /// API key — may be empty for local servers that don't require auth.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model identifier sent in the request (e.g. `"llama3.2"`, `"mistral"`).
+    pub model: String,
+}
+
+fn default_entry_provider() -> String {
+    "openai".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KrabsConfig {
     #[serde(default = "default_model")]
@@ -39,6 +75,9 @@ pub struct KrabsConfig {
     pub max_context_tokens: usize,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// User-defined custom model entries loaded from config.
+    #[serde(default)]
+    pub custom_models: Vec<CustomModelEntry>,
 }
 
 fn default_model() -> String {
@@ -73,6 +112,7 @@ impl Default for KrabsConfig {
             db_path: default_db_path(),
             max_context_tokens: default_max_context_tokens(),
             skills: SkillsConfig::default(),
+            custom_models: Vec::new(),
         }
     }
 }
