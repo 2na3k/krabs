@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 #[async_trait]
@@ -191,8 +191,9 @@ impl KrabsAgent {
         let agent = Arc::clone(&self);
 
         tokio::task::spawn(async move {
-            if let Err(e) = agent.streaming_loop(task, tx.clone()).await {
-                // Surface the error as a Done chunk so the caller isn't left hanging
+            let system_prompt = agent.current_system_prompt().await;
+            let messages = vec![Message::system(&system_prompt), Message::user(task.clone())];
+            if let Err(e) = agent.streaming_loop_inner(task, messages, tx.clone()).await {
                 let _ = tx
                     .send(StreamChunk::Done {
                         usage: crate::providers::provider::TokenUsage {
@@ -208,19 +209,97 @@ impl KrabsAgent {
         Ok(rx)
     }
 
-    async fn streaming_loop(&self, task: String, tx: mpsc::Sender<StreamChunk>) -> Result<()> {
+    /// Run the streaming agent loop over an existing conversation history.
+    ///
+    /// `messages` should contain the full conversation so far, including the
+    /// new user message at the end. The system prompt at position 0 (if any)
+    /// is replaced each turn with the current computed system prompt.
+    ///
+    /// Returns a stream of `StreamChunk`s and a oneshot that fires with the
+    /// final message list (including all new assistant + tool messages) when
+    /// the agent loop completes, or `Err` if the loop fails.
+    pub async fn run_streaming_with_history(
+        self: Arc<Self>,
+        messages: Vec<Message>,
+    ) -> Result<(
+        mpsc::Receiver<StreamChunk>,
+        oneshot::Receiver<Result<Vec<Message>>>,
+    )> {
+        let (tx, rx) = mpsc::channel(64);
+        let (done_tx, done_rx) = oneshot::channel();
+        let agent = Arc::clone(&self);
+        let task = messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::User))
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        tokio::task::spawn(async move {
+            match agent.streaming_loop_inner(task, messages, tx.clone()).await {
+                Ok(final_messages) => {
+                    let _ = done_tx.send(Ok(final_messages));
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(StreamChunk::Done {
+                            usage: crate::providers::provider::TokenUsage {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                            },
+                        })
+                        .await;
+                    let _ = done_tx.send(Err(e));
+                }
+            }
+        });
+
+        Ok((rx, done_rx))
+    }
+
+    /// Core streaming loop. `task` is used only for `AgentStart` hook event label.
+    /// `messages` is the full initial conversation (system + history + user turn).
+    async fn streaming_loop_inner(
+        &self,
+        task: String,
+        mut messages: Vec<Message>,
+        tx: mpsc::Sender<StreamChunk>,
+    ) -> Result<Vec<Message>> {
         let tool_defs = self.registry.tool_defs();
 
         self.hooks
             .fire(&HookEvent::AgentStart { task: task.clone() })
             .await;
 
+        // Ensure a system message is at position 0 (only if non-empty)
         let system_prompt = self.current_system_prompt().await;
-        let mut messages = vec![Message::system(&system_prompt), Message::user(task)];
+        if !system_prompt.is_empty() {
+            if messages
+                .first()
+                .map(|m| matches!(m.role, Role::System))
+                .unwrap_or(false)
+            {
+                messages[0] = Message::system(&system_prompt);
+            } else {
+                messages.insert(0, Message::system(&system_prompt));
+            }
+        } else if messages
+            .first()
+            .map(|m| matches!(m.role, Role::System))
+            .unwrap_or(false)
+        {
+            messages.remove(0);
+        }
 
         for turn in 0..self.config.max_turns {
             let system_prompt = self.current_system_prompt().await;
-            messages[0] = Message::system(&system_prompt);
+            if !system_prompt.is_empty() {
+                if messages.first().map(|m| matches!(m.role, Role::System)).unwrap_or(false) {
+                    messages[0] = Message::system(&system_prompt);
+                } else {
+                    messages.insert(0, Message::system(&system_prompt));
+                }
+            }
 
             self.hooks.fire(&HookEvent::TurnStart { turn }).await;
 
@@ -279,18 +358,13 @@ impl KrabsAgent {
                     turn,
                     tool_calls_this_turn.len()
                 );
-                let calls_summary = tool_calls_this_turn
-                    .iter()
-                    .map(|c| format!("[tool_call: {}({})]", c.name, c.args))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                messages.push(Message::assistant(calls_summary));
+                messages.push(Message::assistant_tool_calls(tool_calls_this_turn.clone()));
 
                 for mut call in tool_calls_this_turn {
                     if !self.permissions.is_allowed(&call.name) {
                         let msg = format!("Permission denied for tool: {}", call.name);
                         warn!("{}", msg);
-                        messages.push(Message::tool_result(&msg, &call.id));
+                        messages.push(Message::tool_result(&msg, &call.id, &call.name));
                         continue;
                     }
 
@@ -308,7 +382,7 @@ impl KrabsAgent {
                         HookOutput::ToolDecision(ToolUseDecision::Deny { reason }) => {
                             let msg = format!("Tool call denied by hook: {}", reason);
                             warn!("{}", msg);
-                            messages.push(Message::tool_result(&msg, &call.id));
+                            messages.push(Message::tool_result(&msg, &call.id, &call.name));
                             continue;
                         }
                         HookOutput::ToolDecision(ToolUseDecision::ModifyArgs { args }) => {
@@ -337,7 +411,7 @@ impl KrabsAgent {
                                     } else {
                                         result.content
                                     };
-                                    messages.push(Message::tool_result(&content, &call.id));
+                                    messages.push(Message::tool_result(&content, &call.id, &call.name));
                                 }
                                 Err(e) => {
                                     self.hooks
@@ -348,14 +422,14 @@ impl KrabsAgent {
                                             tool_use_id: call.id.clone(),
                                         })
                                         .await;
-                                    messages.push(Message::tool_result(e.to_string(), &call.id));
+                                    messages.push(Message::tool_result(e.to_string(), &call.id, &call.name));
                                 }
                             }
                         }
                         None => {
                             let msg = format!("Tool not found: {}", call.name);
                             warn!("{}", msg);
-                            messages.push(Message::tool_result(&msg, &call.id));
+                            messages.push(Message::tool_result(&msg, &call.id, &call.name));
                         }
                     }
                 }
@@ -370,7 +444,7 @@ impl KrabsAgent {
                         result: delta_content,
                     })
                     .await;
-                return Ok(());
+                return Ok(messages);
             }
         }
 
@@ -461,12 +535,7 @@ impl Agent for KrabsAgent {
                     self.total_output_tokens
                         .fetch_add(usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
 
-                    let calls_summary = calls
-                        .iter()
-                        .map(|c| format!("[tool_call: {}({})]", c.name, c.args))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    messages.push(Message::assistant(calls_summary));
+                    messages.push(Message::assistant_tool_calls(calls.clone()));
 
                     for mut call in calls {
                         tool_calls_made += 1;
@@ -474,7 +543,7 @@ impl Agent for KrabsAgent {
                         if !self.permissions.is_allowed(&call.name) {
                             let msg = format!("Permission denied for tool: {}", call.name);
                             warn!("{}", msg);
-                            messages.push(Message::tool_result(&msg, &call.id));
+                            messages.push(Message::tool_result(&msg, &call.id, &call.name));
                             continue;
                         }
 
@@ -492,7 +561,7 @@ impl Agent for KrabsAgent {
                             HookOutput::ToolDecision(ToolUseDecision::Deny { reason }) => {
                                 let msg = format!("Tool call denied by hook: {}", reason);
                                 warn!("{}", msg);
-                                messages.push(Message::tool_result(&msg, &call.id));
+                                messages.push(Message::tool_result(&msg, &call.id, &call.name));
                                 continue;
                             }
                             HookOutput::ToolDecision(ToolUseDecision::ModifyArgs { args }) => {
@@ -521,7 +590,7 @@ impl Agent for KrabsAgent {
                                         } else {
                                             result.content
                                         };
-                                        messages.push(Message::tool_result(&content, &call.id));
+                                        messages.push(Message::tool_result(&content, &call.id, &call.name));
                                     }
                                     Err(e) => {
                                         self.hooks
@@ -533,14 +602,14 @@ impl Agent for KrabsAgent {
                                             })
                                             .await;
                                         messages
-                                            .push(Message::tool_result(e.to_string(), &call.id));
+                                            .push(Message::tool_result(e.to_string(), &call.id, &call.name));
                                     }
                                 }
                             }
                             None => {
                                 let msg = format!("Tool not found: {}", call.name);
                                 warn!("{}", msg);
-                                messages.push(Message::tool_result(&msg, &call.id));
+                                messages.push(Message::tool_result(&msg, &call.id, &call.name));
                             }
                         }
                     }

@@ -60,6 +60,9 @@ fn build_messages(messages: &[Message]) -> Vec<Value> {
             if let Some(id) = &m.tool_call_id {
                 obj["tool_call_id"] = json!(id);
             }
+            if let Some(name) = &m.tool_name {
+                obj["name"] = json!(name);
+            }
             obj
         })
         .collect()
@@ -182,6 +185,11 @@ impl LlmProvider for GeminiProvider {
         });
         if !tools_val.is_empty() {
             body["tools"] = json!(tools_val);
+        }
+
+        // Debug: dump request body to /tmp/krabs_gemini_request.json
+        if let Ok(pretty) = serde_json::to_string_pretty(&body) {
+            let _ = std::fs::write("/tmp/krabs_gemini_request.json", &pretty);
         }
 
         let url = format!("{}/chat/completions", self.base_url());

@@ -3,10 +3,6 @@ name = "krabs-core"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "krabs-core"
-path = "src/main.rs"
-
 [lib]
 name = "krabs_core"
 path = "src/lib.rs"

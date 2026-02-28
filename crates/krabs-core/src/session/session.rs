@@ -148,6 +148,7 @@ impl Session {
                 role,
                 content: row.try_get("content")?,
                 tool_call_id: row.try_get("tool_call_id")?,
+                tool_name: None,
                 tool_calls: None,
             });
         }
@@ -178,6 +179,7 @@ impl Session {
                 role,
                 content: row.try_get("content")?,
                 tool_call_id: row.try_get("tool_call_id")?,
+                tool_name: None,
                 tool_calls: None,
             });
         }

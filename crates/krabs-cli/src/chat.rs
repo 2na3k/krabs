@@ -1,15 +1,13 @@
 use anyhow::Result;
 use crossterm::{
-    event::DisableMouseCapture,
-    event::EnableMouseCapture,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use krabs_core::{
     skills::loader::SkillLoader, AgentPersona, BashTool, Credentials, GlobTool, GrepTool,
     HookConfig, HookEntry, KrabsConfig, LlmProvider, McpRegistry, McpServer, Message, ReadTool,
-    Role, SkillsConfig, StreamChunk, TokenUsage, ToolCall, ToolDef, ToolRegistry, WriteTool,
+    Role, SkillsConfig, StreamChunk, TokenUsage, ToolCall, ToolRegistry, WriteTool,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -208,6 +206,10 @@ struct App {
     total_output: u32,
     suggest_idx: Option<usize>, // selected index in suggestion popup
     active_persona: Option<AgentPersona>,
+    system_prompt_text: String,
+    persona_text: String,
+    tools_text: String,
+    memory_text: String,
     personas: Vec<AgentPersona>,
     /// Tools approved with "always allow" — no prompt on subsequent calls.
     approved_tools: HashSet<String>,
@@ -234,6 +236,10 @@ impl App {
             personas: Vec::new(),
             approved_tools: HashSet::new(),
             pending_permission: None,
+            system_prompt_text: String::new(),
+            persona_text: String::new(),
+            tools_text: String::new(),
+            memory_text: String::new(),
         }
     }
 
@@ -306,137 +312,139 @@ fn extract_api_error(raw: &str) -> String {
     raw.to_string()
 }
 
-// ── background agentic task ──────────────────────────────────────────────────
+// ── TUI hook — bridges KrabsAgent lifecycle events into DisplayEvents ─────────
 
-async fn run_turn(
-    mut messages: Vec<Message>,
-    provider: Arc<dyn LlmProvider>,
-    tool_defs: Vec<ToolDef>,
-    registry: Arc<ToolRegistry>,
+struct TuiHook {
     tx: mpsc::Sender<DisplayEvent>,
-) {
-    let mut iterations = 0usize;
-    loop {
-        iterations += 1;
-        if iterations > 10 {
-            let _ = tx
-                .send(DisplayEvent::Error(
-                    "agentic loop exceeded 10 iterations — stopping".into(),
-                ))
-                .await;
-            return;
-        }
-        let (inner_tx, mut inner_rx) = mpsc::channel::<StreamChunk>(64);
-        let mut text = String::new();
-        let mut calls: Vec<ToolCall> = Vec::new();
-        let mut usage = TokenUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-        };
-        let mut got_done = false;
+}
 
-        let p2 = Arc::clone(&provider);
-        let m2 = messages.clone();
-        let d2 = tool_defs.clone();
-        let tx2 = tx.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = p2.stream_complete(&m2, &d2, inner_tx).await {
-                let msg = extract_api_error(&e.to_string());
-                let _ = tx2.send(DisplayEvent::Error(msg)).await;
-            }
-        });
-
-        while let Some(chunk) = inner_rx.recv().await {
-            match chunk {
-                StreamChunk::Delta { text: t } => {
-                    text.push_str(&t);
-                    if tx.send(DisplayEvent::Token(t)).await.is_err() {
-                        return;
-                    }
-                }
-                StreamChunk::ToolCallReady { call } => {
-                    calls.push(call.clone());
-                    if tx.send(DisplayEvent::ToolCallStart(call)).await.is_err() {
-                        return;
-                    }
-                }
-                StreamChunk::Done { usage: u } => {
-                    usage = u;
-                    got_done = true;
-                }
-            }
-        }
-
-        // If provider errored it sends DisplayEvent::Error and closes inner_tx without Done
-        let _ = handle.await;
-        if !got_done {
-            return;
-        }
-
-        let _ = tx.send(DisplayEvent::TurnUsage(usage)).await;
-
-        // push assistant turn to conversation history
-        if calls.is_empty() {
-            messages.push(Message::assistant(&text));
-        } else {
-            messages.push(Message::assistant_tool_calls(calls.clone()));
-        }
-
-        if calls.is_empty() {
-            let _ = tx.send(DisplayEvent::Done(messages)).await;
-            return;
-        }
-
-        // execute tool calls
-        for call in calls {
-            // Ask the UI for permission before running the tool
-            let (permit_tx, permit_rx) = oneshot::channel::<bool>();
-            let args_display = serde_json::to_string(&call.args).unwrap_or_default();
-            if tx
-                .send(DisplayEvent::PermissionRequest {
-                    tool_name: call.name.clone(),
-                    args: args_display,
-                    respond: permit_tx,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-            // Block until the user decides (or stream is cancelled)
-            let allowed = permit_rx.await.unwrap_or(false);
-            if !allowed {
-                let msg = format!("tool '{}' denied by user", call.name);
-                if tx
-                    .send(DisplayEvent::ToolResultEnd(msg.clone()))
+#[async_trait::async_trait]
+impl krabs_core::Hook for TuiHook {
+    async fn on_event(
+        &self,
+        event: &krabs_core::HookEvent,
+    ) -> anyhow::Result<krabs_core::HookOutput> {
+        use krabs_core::{HookEvent, HookOutput, ToolUseDecision};
+        match event {
+            // Before a tool runs: ask the user for permission
+            HookEvent::PreToolUse {
+                tool_name,
+                args,
+                tool_use_id: _,
+            } => {
+                let (respond, rx) = oneshot::channel::<bool>();
+                let args_str = serde_json::to_string(args).unwrap_or_default();
+                // If the send fails the channel is closed (turn cancelled) — deny
+                if self
+                    .tx
+                    .send(DisplayEvent::PermissionRequest {
+                        tool_name: tool_name.clone(),
+                        args: args_str,
+                        respond,
+                    })
                     .await
                     .is_err()
                 {
+                    return Ok(HookOutput::ToolDecision(ToolUseDecision::Deny {
+                        reason: "channel closed".into(),
+                    }));
+                }
+                let allowed = rx.await.unwrap_or(false);
+                if allowed {
+                    Ok(HookOutput::Continue)
+                } else {
+                    Ok(HookOutput::ToolDecision(ToolUseDecision::Deny {
+                        reason: "denied by user".into(),
+                    }))
+                }
+            }
+            // After a tool succeeds: show the result in the TUI
+            HookEvent::PostToolUse { result, .. } => {
+                let _ = self
+                    .tx
+                    .send(DisplayEvent::ToolResultEnd(result.clone()))
+                    .await;
+                Ok(HookOutput::Continue)
+            }
+            _ => Ok(HookOutput::Continue),
+        }
+    }
+}
+
+// ── background agentic task ──────────────────────────────────────────────────
+
+/// Build a per-turn `KrabsAgent` with the given provider, registry, system
+/// prompt, and a `TuiHook` wired to the display-event channel.
+fn build_agent(
+    config: &KrabsConfig,
+    provider: Arc<dyn LlmProvider>,
+    registry: Arc<ToolRegistry>,
+    system_prompt: String,
+    tx: mpsc::Sender<DisplayEvent>,
+) -> Arc<krabs_core::KrabsAgent> {
+    let mut tool_registry = ToolRegistry::new();
+    for name in registry.names() {
+        if let Some(t) = registry.get(&name) {
+            tool_registry.register(t);
+        }
+    }
+    krabs_core::KrabsAgentBuilder::new(config.clone(), provider)
+        .registry(tool_registry)
+        .system_prompt(system_prompt)
+        .hook(Arc::new(TuiHook { tx }))
+        .build()
+}
+
+async fn run_agent_turn(
+    agent: Arc<krabs_core::KrabsAgent>,
+    messages: Vec<Message>,
+    tx: mpsc::Sender<DisplayEvent>,
+) {
+    let (mut stream, done_rx) = match agent.run_streaming_with_history(messages).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx
+                .send(DisplayEvent::Error(extract_api_error(&e.to_string())))
+                .await;
+            return;
+        }
+    };
+
+    while let Some(chunk) = stream.recv().await {
+        match chunk {
+            StreamChunk::Delta { text } => {
+                if tx.send(DisplayEvent::Token(text)).await.is_err() {
                     return;
                 }
-                messages.push(Message::tool_result(&msg, &call.id));
-                continue;
             }
-
-            let result = match registry.get(&call.name) {
-                Some(tool) => match tool.call(call.args.clone()).await {
-                    Ok(r) => r,
-                    Err(e) => krabs_core::ToolResult::err(e.to_string()),
-                },
-                None => krabs_core::ToolResult::err(format!("tool '{}' not found", call.name)),
-            };
-            let content = result.content.clone();
-            if tx
-                .send(DisplayEvent::ToolResultEnd(content.clone()))
-                .await
-                .is_err()
-            {
-                return;
+            StreamChunk::ToolCallReady { call } => {
+                if tx.send(DisplayEvent::ToolCallStart(call)).await.is_err() {
+                    return;
+                }
             }
-            messages.push(Message::tool_result(&content, &call.id));
+            StreamChunk::Done { usage } => {
+                if tx.send(DisplayEvent::TurnUsage(usage)).await.is_err() {
+                    return;
+                }
+            }
         }
-        // loop → next LLM turn
     }
+
+    // Stream closed — get final message history from done channel
+    let final_messages = match done_rx.await {
+        Ok(Ok(msgs)) => msgs,
+        Ok(Err(e)) => {
+            let _ = tx
+                .send(DisplayEvent::Error(extract_api_error(&e.to_string())))
+                .await;
+            return;
+        }
+        Err(_) => {
+            // sender dropped without sending — treat as empty (turn was cancelled)
+            return;
+        }
+    };
+    let _ = tx.send(DisplayEvent::Done(final_messages)).await;
 }
 
 // ── slash suggestions ─────────────────────────────────────────────────────────
@@ -514,13 +522,38 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
     // ── info box ──────────────────────────────────────────────────────────────
     let used = app.total_input + app.total_output;
     let pct = (used as f32 / max_ctx as f32 * 100.0).min(100.0);
-    let filled = (pct / 5.0).round() as usize;
-    let ctx_bar = format!(
-        "[{}{}] {:.1}%",
-        "█".repeat(filled),
-        "░".repeat(20 - filled),
-        pct
-    );
+
+    // Build segmented context bar
+    const CTX_BAR_WIDTH: usize = 20;
+    let t_system = estimate_tokens(&app.system_prompt_text);
+    let t_persona = estimate_tokens(&app.persona_text);
+    let t_memory = estimate_tokens(&app.memory_text);
+    let t_tools = estimate_tokens(&app.tools_text);
+    let t_messages = used.saturating_sub(t_system + t_persona + t_memory + t_tools);
+    let t_free = max_ctx.saturating_sub(used);
+    let seg_w = |tok: u32| -> usize {
+        ((tok as f32 / max_ctx as f32) * CTX_BAR_WIDTH as f32).round() as usize
+    };
+    let cat_segs = [
+        (seg_w(t_system), Color::Green),
+        (seg_w(t_persona), MR_KRABS_ORANGE),
+        (seg_w(t_tools), Color::Magenta),
+        (seg_w(t_memory), Color::Blue),
+        (seg_w(t_messages), Color::Cyan),
+        (seg_w(t_free), Color::DarkGray),
+    ];
+    let mut ctx_spans: Vec<Span> = vec![Span::raw("[")];
+    for (w, color) in &cat_segs {
+        if *w > 0 {
+            ctx_spans.push(Span::styled("█".repeat(*w), Style::default().fg(*color)));
+        }
+    }
+    ctx_spans.push(Span::raw("] "));
+    ctx_spans.push(Span::styled(
+        format!("{:.1}%", pct),
+        Style::default().fg(Color::Yellow),
+    ));
+
     let mut info_lines = vec![
         Line::from(vec![
             Span::styled("  provider  ", Style::default().fg(Color::DarkGray)),
@@ -546,10 +579,11 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
             Span::styled("  tools   ", Style::default().fg(Color::DarkGray)),
             Span::styled(&info.tools, Style::default().fg(Color::White)),
         ]),
-        Line::from(vec![
-            Span::styled("  ctx     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(ctx_bar, Style::default().fg(Color::Yellow)),
-        ]),
+        Line::from({
+            let mut spans = vec![Span::styled("  ctx     ", Style::default().fg(Color::DarkGray))];
+            spans.extend(ctx_spans);
+            spans
+        }),
     ];
     if let Some(ref persona) = app.active_persona {
         info_lines.push(Line::from(vec![
@@ -1010,23 +1044,91 @@ fn parse_hook_rest(rest: &[&str]) -> (Option<String>, String, Option<String>) {
     (matcher, action, reason)
 }
 
-fn cmd_usage(app: &mut App, max_ctx: u32) {
+fn estimate_tokens(s: &str) -> u32 {
+    ((s.len() as f32) / 4.0).ceil() as u32
+}
+
+fn fmt_k(n: u32) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f32 / 1000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn cmd_usage(app: &mut App, max_ctx: u32, skills_config: &SkillsConfig) {
+    const BAR: usize = 40;
+
     let used = app.total_input + app.total_output;
     let pct = (used as f32 / max_ctx as f32 * 100.0).min(100.0);
-    let filled = (pct / 5.0).round() as usize;
-    let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(20 - filled));
-    app.push(ChatMsg::Info(format!("context  {bar}  {pct:.1}%")));
+
+    // Compute estimated token counts per category
+    let t_system = estimate_tokens(&app.system_prompt_text);
+    let t_persona = estimate_tokens(&app.persona_text);
+    let t_memory = estimate_tokens(&app.memory_text);
+    let t_tools = estimate_tokens(&app.tools_text);
+
+    // Skills: compute lazily from config (same source as agent does)
+    let skills = SkillLoader::discover(skills_config);
+    let skills_text: String = skills
+        .iter()
+        .map(|s| format!("{}: {}", s.name, s.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let t_skills = estimate_tokens(&skills_text);
+
+    // Messages estimate from API-reported totals, minus estimated overhead
+    let overhead = t_system + t_persona + t_memory + t_tools + t_skills;
+    let t_messages = used.saturating_sub(overhead);
+    let t_free = max_ctx.saturating_sub(used);
+
+    // Build per-category bar segments (proportional to max_ctx)
+    let seg = |tok: u32| -> usize {
+        ((tok as f32 / max_ctx as f32) * BAR as f32).round() as usize
+    };
+
+    let segs = [
+        (seg(t_system), 'S', Color::Green),
+        (seg(t_persona), 'P', Color::Rgb(255, 128, 0)),
+        (seg(t_tools), 'T', Color::Magenta),
+        (seg(t_skills), 'K', Color::LightGreen),
+        (seg(t_memory), 'M', Color::Blue),
+        (seg(t_messages), 'C', Color::Cyan),
+        (seg(t_free), 'F', Color::DarkGray),
+    ];
+
+    let header = format!("context usage  {pct:.1}%  ({} / {} tokens)", fmt_k(used), fmt_k(max_ctx));
+    app.push(ChatMsg::Info(header));
+    app.push(ChatMsg::Info(String::new()));
+
+    let rows = [
+        ("system  ", t_system, 0usize),
+        ("persona ", t_persona, 1),
+        ("tools   ", t_tools, 2),
+        ("skills  ", t_skills, 3),
+        ("memory  ", t_memory, 4),
+        ("messages", t_messages, 5),
+        ("free    ", t_free, 6),
+    ];
+
+    for (label, tok, idx) in &rows {
+        let w = segs[*idx].0.min(BAR);
+        let ch = segs[*idx].1;
+        // Build bar: this category chars filled, rest as ░
+        let bar_str: String = std::iter::repeat_n(ch, w)
+            .chain(std::iter::repeat_n('░', BAR - w))
+            .collect();
+        let tok_pct = (*tok as f32 / max_ctx as f32 * 100.0).min(100.0);
+        app.push(ChatMsg::Info(format!(
+            "  {label}  [{bar_str}]  ~{:>5}  {tok_pct:.1}%",
+            fmt_k(*tok)
+        )));
+    }
+    app.push(ChatMsg::Info(format!("  {}", "─".repeat(BAR + 30))));
     app.push(ChatMsg::Info(format!(
-        "input    {} tokens",
-        app.total_input
-    )));
-    app.push(ChatMsg::Info(format!(
-        "output   {} tokens",
-        app.total_output
-    )));
-    app.push(ChatMsg::Info(format!(
-        "total    {} / {} tokens",
-        used, max_ctx
+        "  total     ~{} / {} ({pct:.1}% used)",
+        fmt_k(used),
+        fmt_k(max_ctx)
     )));
 }
 
@@ -1126,7 +1228,6 @@ pub async fn run(creds: Credentials) -> Result<()> {
     let krabs_config = KrabsConfig::load().unwrap_or_default();
     let mut provider: Arc<dyn LlmProvider> = Arc::from(creds.build_provider());
     let registry = Arc::new(build_registry());
-    let tool_defs = registry.tool_defs();
     let max_ctx = context_limit(&creds.model);
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -1138,9 +1239,17 @@ pub async fn run(creds: Credentials) -> Result<()> {
         tools: registry.names().join(", "),
     };
 
-    // Terminal setup
+    // Terminal setup — install a panic hook so we always restore the terminal
+    // even if something panics, otherwise the shell is left in raw mode.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
 
@@ -1171,22 +1280,6 @@ pub async fn run(creds: Credentials) -> Result<()> {
             // ── keyboard ──
             key = key_rx.recv() => {
                 let Some(ev) = key else { break };
-
-                // Mouse scroll
-                if let Event::Mouse(m) = ev {
-                    match m.kind {
-                        MouseEventKind::ScrollUp => {
-                            app.auto_scroll = false;
-                            app.scroll = app.scroll.saturating_sub(3);
-                        }
-                        MouseEventKind::ScrollDown => {
-                            app.scroll = app.scroll.saturating_add(3);
-                            if app.scroll == u16::MAX { app.auto_scroll = true; }
-                        }
-                        _ => {}
-                    }
-                    continue 'main;
-                }
 
                 let Event::Key(key) = ev else { continue 'main };
                 if key.kind != KeyEventKind::Press { continue 'main; }
@@ -1228,15 +1321,8 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                 Some(i) => i - 1,
                             });
                         } else {
-                            // history navigation
-                            if !app.history.is_empty() {
-                                let idx = app.history_idx
-                                    .map(|i| i.saturating_sub(1))
-                                    .unwrap_or(app.history.len() - 1);
-                                app.history_idx = Some(idx);
-                                app.input = app.history[idx].clone();
-                                app.cursor = app.input.len();
-                            }
+                            app.auto_scroll = false;
+                            app.scroll = app.scroll.saturating_sub(3);
                         }
                         continue 'main;
                     }
@@ -1260,27 +1346,18 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                 Some(i) => (i + 1) % len,
                             });
                         } else {
-                            // history navigation forward
-                            if let Some(idx) = app.history_idx {
-                                if idx + 1 < app.history.len() {
-                                    app.history_idx = Some(idx + 1);
-                                    app.input = app.history[idx + 1].clone();
-                                } else {
-                                    app.history_idx = None;
-                                    app.input.clear();
-                                }
-                                app.cursor = app.input.len();
-                            }
+                            app.scroll = app.scroll.saturating_add(3);
+                            if app.scroll == u16::MAX { app.auto_scroll = true; }
                         }
                         continue 'main;
                     }
                     KeyCode::Up => {
                         app.auto_scroll = false;
-                        app.scroll = app.scroll.saturating_sub(1);
+                        app.scroll = app.scroll.saturating_sub(3);
                         continue 'main;
                     }
                     KeyCode::Down => {
-                        app.scroll = app.scroll.saturating_add(1);
+                        app.scroll = app.scroll.saturating_add(3);
                         if app.scroll == u16::MAX { app.auto_scroll = true; }
                         continue 'main;
                     }
@@ -1468,6 +1545,7 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                     system_prompt: app.personas[pos].system_prompt.clone(),
                                     path: app.personas[pos].path.clone(),
                                 });
+                                app.persona_text = app.personas[pos].system_prompt.clone();
                                 let _ = persona_name; // used above
                             } else {
                                 app.push(ChatMsg::Error(format!(
@@ -1492,7 +1570,7 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                 let mcp_args = s.strip_prefix("/mcp").unwrap_or("").trim();
                                 cmd_mcp(&mut app, mcp_args).await;
                             }
-                            "/usage"  => cmd_usage(&mut app, max_ctx),
+                            "/usage"  => cmd_usage(&mut app, max_ctx, &krabs_config.skills),
                             s if s == "/agents" || s.starts_with("/agents ") => {
                                 let args = s.strip_prefix("/agents").unwrap_or("").trim();
                                 cmd_agents(&mut app, args);
@@ -1524,14 +1602,25 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                 messages.push(Message::user(&input));
                                 app.spinning = true;
 
+                                // Capture context breakdown estimates (once per turn)
+                                const BASE_SYSTEM_PROMPT: &str = "You are Krabs, an agentic assistant.";
+                                app.system_prompt_text = BASE_SYSTEM_PROMPT.to_string();
+                                app.tools_text = serde_json::to_string(&registry.tool_defs())
+                                    .unwrap_or_default();
+
                                 let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
                                 stream_rx = Some(rx);
 
-                                turn_handle = Some(tokio::spawn(run_turn(
-                                    turn_messages,
+                                let agent = build_agent(
+                                    &krabs_config,
                                     Arc::clone(&provider),
-                                    tool_defs.clone(),
                                     Arc::clone(&registry),
+                                    String::new(), // system prompt injected by KrabsAgent
+                                    tx.clone(),
+                                );
+                                turn_handle = Some(tokio::spawn(run_agent_turn(
+                                    agent,
+                                    turn_messages,
                                     tx,
                                 )));
                             }
@@ -1609,7 +1698,7 @@ pub async fn run(creds: Credentials) -> Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
     Ok(())
 }
