@@ -1,19 +1,12 @@
 [package]
 name = "krabs-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2026"
 
 [lib]
 name = "krabs_core"
 path = "src/lib.rs"
 
-[[example]]
-name = "basic_agent"
-path = "../../example/basic_agent.rs"
-
-[[example]]
-name = "seed_session"
-path = "../../example/seed_session.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

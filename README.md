@@ -41,9 +41,9 @@ Krabs supports three LLM providers out of the box:
 
 | Provider  | Models                          |
 |-----------|---------------------------------|
-| Anthropic | claude-opus-4, claude-sonnet-4, etc. |
-| OpenAI    | gpt-4o, gpt-4o-mini, etc.       |
-| Gemini    | gemini-2.0-flash, etc.          |
+| Anthropic | claude-opus-4.6, claude-sonnet-4.6, etc. |
+| OpenAI    | gpt-5.1, gpt-5.2-mini, etc.       |
+| Gemini    | gemini-3.0-flash, etc.          |
 
 Switch models mid-session with `/models <model-name>`.
 
