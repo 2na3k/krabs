@@ -78,6 +78,12 @@ pub struct KrabsConfig {
     /// User-defined custom model entries loaded from config.
     #[serde(default)]
     pub custom_models: Vec<CustomModelEntry>,
+    /// How many times to retry a failed LLM API call before giving up.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+    /// Base delay in milliseconds for exponential backoff between retries.
+    #[serde(default = "default_retry_base_delay_ms")]
+    pub retry_base_delay_ms: u64,
 }
 
 fn default_model() -> String {
@@ -100,6 +106,14 @@ fn default_max_context_tokens() -> usize {
     128_000
 }
 
+fn default_max_retries() -> usize {
+    3
+}
+
+fn default_retry_base_delay_ms() -> u64 {
+    500
+}
+
 impl Default for KrabsConfig {
     fn default() -> Self {
         Self {
@@ -113,6 +127,8 @@ impl Default for KrabsConfig {
             max_context_tokens: default_max_context_tokens(),
             skills: SkillsConfig::default(),
             custom_models: Vec::new(),
+            max_retries: default_max_retries(),
+            retry_base_delay_ms: default_retry_base_delay_ms(),
         }
     }
 }

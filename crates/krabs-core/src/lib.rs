@@ -36,3 +36,4 @@ pub use tools::registry::ToolRegistry;
 pub use tools::tool::{Tool, ToolDef, ToolResult};
 pub use tools::write::WriteTool;
 pub use tools::ReadSkillTool;
+pub use session::session::{Session, SessionStore, StoredCheckpoint, StoredMessage, StoredError};

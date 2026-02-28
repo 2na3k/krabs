@@ -44,6 +44,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/usage", "show context window usage"),
     ("/clear", "clear screen and conversation"),
+    ("/resume", "resume a session  usage: /resume <session-id>"),
     ("/quit", "exit Krabs"),
 ];
 
@@ -92,6 +93,52 @@ fn context_limit(model: &str) -> u32 {
     } else {
         1_000_000
     }
+}
+
+/// Load a persisted session's history and convert it to display messages.
+/// Returns `(messages_for_agent, display_messages_for_tui)`.
+async fn load_resume_history(
+    config: &KrabsConfig,
+    session_id: &str,
+) -> (Vec<Message>, Vec<ChatMsg>) {
+    use krabs_core::{SessionStore, session::session::Session as KrabsSession};
+
+    let store = match SessionStore::open(&config.db_path).await {
+        Ok(s) => s,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+    let session = match store.load_session(session_id).await {
+        Ok(s) => s,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+
+    let stored = match session.latest_checkpoint().await {
+        Ok(Some(cp)) => {
+            let _ = session.rollback_to(cp.last_msg_id).await;
+            session.messages_up_to(cp.last_msg_id).await.unwrap_or_default()
+        }
+        _ => session.messages().await.unwrap_or_default(),
+    };
+
+    let mut messages = Vec::new();
+    let mut display: Vec<ChatMsg> = Vec::new();
+
+    for s in &stored {
+        match KrabsSession::stored_to_message(s) {
+            Ok(msg) => {
+                let dm = match s.role.as_str() {
+                    "user" => ChatMsg::User(s.content.clone()),
+                    "assistant" if s.tool_args.is_none() => ChatMsg::Assistant(s.content.clone()),
+                    _ => ChatMsg::Info(format!("[{}] {}", s.role, s.content)),
+                };
+                display.push(dm);
+                messages.push(msg);
+            }
+            Err(_) => {}
+        }
+    }
+
+    (messages, display)
 }
 
 fn build_registry() -> ToolRegistry {
@@ -433,12 +480,13 @@ impl krabs_core::Hook for TuiHook {
 
 /// Build a per-turn `KrabsAgent` with the given provider, registry, system
 /// prompt, and a `TuiHook` wired to the display-event channel.
-fn build_agent(
+async fn build_agent(
     config: &KrabsConfig,
     provider: Arc<dyn LlmProvider>,
     registry: Arc<ToolRegistry>,
     system_prompt: String,
     tx: mpsc::Sender<DisplayEvent>,
+    resume_session_id: Option<String>,
 ) -> Arc<krabs_core::KrabsAgent> {
     let mut tool_registry = ToolRegistry::new();
     for name in registry.names() {
@@ -470,11 +518,15 @@ fn build_agent(
         }
     });
     tool_registry.register(Arc::new(UserInputTool::new(ui_tx)));
-    krabs_core::KrabsAgentBuilder::new(config.clone(), provider)
+    let builder = krabs_core::KrabsAgentBuilder::new(config.clone(), provider)
         .registry(tool_registry)
         .system_prompt(system_prompt)
-        .hook(Arc::new(TuiHook { tx }))
-        .build()
+        .hook(Arc::new(TuiHook { tx }));
+    let builder = match resume_session_id {
+        Some(sid) => builder.resume_session(sid),
+        None => builder,
+    };
+    builder.build_async().await
 }
 
 async fn run_agent_turn(
@@ -1514,7 +1566,7 @@ async fn show_splash(
 
 // ── main entry ───────────────────────────────────────────────────────────────
 
-pub async fn run(creds: Credentials) -> Result<()> {
+pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
     let krabs_config = KrabsConfig::load().unwrap_or_default();
     let mut creds = creds;
     let mut provider: Arc<dyn LlmProvider> = Arc::from(creds.build_provider());
@@ -1561,6 +1613,21 @@ pub async fn run(creds: Credentials) -> Result<()> {
     let mut app = App::new();
     app.personas = AgentPersona::discover();
     let mut messages: Vec<Message> = Vec::new();
+
+    // If resuming, reconstruct history from the persisted session.
+    let mut active_resume_id: Option<String> = None;
+    if let Some(ref sid) = resume_id {
+        let (history, display_msgs) = load_resume_history(&krabs_config, sid).await;
+        if !history.is_empty() {
+            for dm in display_msgs {
+                app.chat.push(dm);
+            }
+            messages = history;
+            active_resume_id = Some(sid.clone());
+            app.push(ChatMsg::Info(format!("Resumed session {sid}")));
+        }
+    }
+
     let mut stream_rx: Option<mpsc::Receiver<DisplayEvent>> = None;
     let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1964,8 +2031,36 @@ pub async fn run(creds: Credentials) -> Result<()> {
                             "/clear" => {
                                 app.chat.clear();
                                 messages.clear();
+                                active_resume_id = None;
                                 app.total_input = 0;
                                 app.total_output = 0;
+                            }
+                            s if s.starts_with("/resume ") => {
+                                let sid = s.strip_prefix("/resume ").unwrap_or("").trim();
+                                if sid.is_empty() {
+                                    app.push(ChatMsg::Error("usage: /resume <session-id>".into()));
+                                } else {
+                                    let (history, display_msgs) =
+                                        load_resume_history(&krabs_config, sid).await;
+                                    if history.is_empty() {
+                                        app.push(ChatMsg::Error(format!(
+                                            "Session {sid} not found or empty"
+                                        )));
+                                    } else {
+                                        app.chat.clear();
+                                        messages.clear();
+                                        app.total_input = 0;
+                                        app.total_output = 0;
+                                        for dm in display_msgs {
+                                            app.chat.push(dm);
+                                        }
+                                        messages = history;
+                                        active_resume_id = Some(sid.to_string());
+                                        app.push(ChatMsg::Info(format!(
+                                            "Resumed session {sid}"
+                                        )));
+                                    }
+                                }
                             }
                             "/tools"  => cmd_tools(&mut app, &registry),
                             "/skills" => cmd_skills(&mut app, &krabs_config.skills),
@@ -2028,7 +2123,9 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                     Arc::clone(&registry),
                                     String::new(), // system prompt injected by KrabsAgent
                                     tx.clone(),
-                                );
+                                    active_resume_id.take(),
+                                )
+                                .await;
                                 turn_handle = Some(tokio::spawn(run_agent_turn(
                                     agent,
                                     turn_messages,

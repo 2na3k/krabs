@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "basic_agent"
 path = "../../example/basic_agent.rs"
 
+[[example]]
+name = "seed_session"
+path = "../../example/seed_session.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
