@@ -83,7 +83,10 @@ impl LlmProvider for AnthropicProvider {
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
-        let mut usage = TokenUsage { input_tokens: 0, output_tokens: 0 };
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
 
         while let Some(chunk) = rx.recv().await {
             match chunk {
@@ -94,7 +97,10 @@ impl LlmProvider for AnthropicProvider {
         }
 
         if !tool_calls.is_empty() {
-            Ok(LlmResponse::ToolCalls { calls: tool_calls, usage })
+            Ok(LlmResponse::ToolCalls {
+                calls: tool_calls,
+                usage,
+            })
         } else {
             Ok(LlmResponse::Message { content, usage })
         }
@@ -188,7 +194,11 @@ impl LlmProvider for AnthropicProvider {
                         if delta_type == "text_delta" {
                             if let Some(text) = delta["text"].as_str() {
                                 if !text.is_empty() {
-                                    let _ = tx.send(StreamChunk::Delta { text: text.to_string() }).await;
+                                    let _ = tx
+                                        .send(StreamChunk::Delta {
+                                            text: text.to_string(),
+                                        })
+                                        .await;
                                 }
                             }
                         } else if delta_type == "input_json_delta" {
@@ -203,11 +213,15 @@ impl LlmProvider for AnthropicProvider {
                     "content_block_stop" => {
                         let idx = ev["index"].as_u64().unwrap_or(0) as usize;
                         if let Some((id, name, args_str)) = tool_blocks.remove(&idx) {
-                            let args: Value =
-                                serde_json::from_str(&args_str).unwrap_or(json!({}));
+                            let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
                             let _ = tx
                                 .send(StreamChunk::ToolCallReady {
-                                    call: ToolCall { id, name, args, thought_signature: None },
+                                    call: ToolCall {
+                                        id,
+                                        name,
+                                        args,
+                                        thought_signature: None,
+                                    },
                                 })
                                 .await;
                         }
@@ -215,9 +229,8 @@ impl LlmProvider for AnthropicProvider {
                     "message_delta" => {
                         if let Some(usage) = ev.get("usage") {
                             let tok = TokenUsage {
-                                input_tokens: ev["usage"]["input_tokens"]
-                                    .as_u64()
-                                    .unwrap_or(0) as u32,
+                                input_tokens: ev["usage"]["input_tokens"].as_u64().unwrap_or(0)
+                                    as u32,
                                 output_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as u32,
                             };
                             let _ = tx.send(StreamChunk::Done { usage: tok }).await;

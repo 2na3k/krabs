@@ -42,14 +42,16 @@ fn build_messages(messages: &[Message]) -> Vec<Value> {
             if let Some(calls) = &m.tool_calls {
                 let tc_arr: Vec<Value> = calls
                     .iter()
-                    .map(|c| json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": {
-                            "name": c.name,
-                            "arguments": c.args.to_string()
-                        }
-                    }))
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {
+                                "name": c.name,
+                                "arguments": c.args.to_string()
+                            }
+                        })
+                    })
                     .collect();
                 return json!({ "role": role, "content": null, "tool_calls": tc_arr });
             }
@@ -115,12 +117,20 @@ impl LlmProvider for OpenAiProvider {
                             let name = tc["function"]["name"].as_str()?.to_string();
                             let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                             let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-                            Some(ToolCall { id, name, args, thought_signature: None })
+                            Some(ToolCall {
+                                id,
+                                name,
+                                args,
+                                thought_signature: None,
+                            })
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            Ok(LlmResponse::ToolCalls { calls: tool_calls, usage })
+            Ok(LlmResponse::ToolCalls {
+                calls: tool_calls,
+                usage,
+            })
         } else {
             let content = message["content"].as_str().unwrap_or("").to_string();
             Ok(LlmResponse::Message { content, usage })
@@ -207,7 +217,11 @@ impl LlmProvider for OpenAiProvider {
 
                 if let Some(text) = msg_delta["content"].as_str() {
                     if !text.is_empty() {
-                        let _ = tx.send(StreamChunk::Delta { text: text.to_string() }).await;
+                        let _ = tx
+                            .send(StreamChunk::Delta {
+                                text: text.to_string(),
+                            })
+                            .await;
                     }
                 }
 
@@ -237,7 +251,12 @@ impl LlmProvider for OpenAiProvider {
                             let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
                             let _ = tx
                                 .send(StreamChunk::ToolCallReady {
-                                    call: ToolCall { id, name, args, thought_signature: None },
+                                    call: ToolCall {
+                                        id,
+                                        name,
+                                        args,
+                                        thought_signature: None,
+                                    },
                                 })
                                 .await;
                         }
@@ -255,14 +274,22 @@ impl LlmProvider for OpenAiProvider {
                     let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
                     let _ = tx
                         .send(StreamChunk::ToolCallReady {
-                            call: ToolCall { id, name, args, thought_signature: None },
+                            call: ToolCall {
+                                id,
+                                name,
+                                args,
+                                thought_signature: None,
+                            },
                         })
                         .await;
                 }
             }
         }
 
-        let usage = last_usage.unwrap_or(TokenUsage { input_tokens: 0, output_tokens: 0 });
+        let usage = last_usage.unwrap_or(TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        });
         let _ = tx.send(StreamChunk::Done { usage }).await;
 
         Ok(())

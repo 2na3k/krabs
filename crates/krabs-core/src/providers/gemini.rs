@@ -82,10 +82,17 @@ fn flush_tool_calls(
     indices
         .into_iter()
         .filter_map(|idx| {
-            tool_calls.remove(&idx).map(|(id, name, args_str, thought_signature)| {
-                let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
-                ToolCall { id, name, args, thought_signature }
-            })
+            tool_calls
+                .remove(&idx)
+                .map(|(id, name, args_str, thought_signature)| {
+                    let args: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
+                    ToolCall {
+                        id,
+                        name,
+                        args,
+                        thought_signature,
+                    }
+                })
         })
         .collect()
 }
@@ -134,15 +141,24 @@ impl LlmProvider for GeminiProvider {
                             let name = tc["function"]["name"].as_str()?.to_string();
                             let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                             let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-                            let thought_signature = tc["extra_content"]["google"]["thought_signature"]
+                            let thought_signature = tc["extra_content"]["google"]
+                                ["thought_signature"]
                                 .as_str()
                                 .map(|s| s.to_string());
-                            Some(ToolCall { id, name, args, thought_signature })
+                            Some(ToolCall {
+                                id,
+                                name,
+                                args,
+                                thought_signature,
+                            })
                         })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            Ok(LlmResponse::ToolCalls { calls: tool_calls, usage })
+            Ok(LlmResponse::ToolCalls {
+                calls: tool_calls,
+                usage,
+            })
         } else {
             let content = message["content"].as_str().unwrap_or("").to_string();
             Ok(LlmResponse::Message { content, usage })
@@ -183,8 +199,10 @@ impl LlmProvider for GeminiProvider {
         }
 
         // index -> (id, name, args, thought_signature)
-        let mut tool_calls: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
-            std::collections::HashMap::new();
+        let mut tool_calls: std::collections::HashMap<
+            usize,
+            (String, String, String, Option<String>),
+        > = std::collections::HashMap::new();
         let mut last_usage: Option<TokenUsage> = None;
         let mut byte_stream = raw_resp.bytes_stream();
         let mut leftover = String::new();
@@ -229,7 +247,11 @@ impl LlmProvider for GeminiProvider {
 
                 if let Some(text) = msg_delta["content"].as_str() {
                     if !text.is_empty() {
-                        let _ = tx.send(StreamChunk::Delta { text: text.to_string() }).await;
+                        let _ = tx
+                            .send(StreamChunk::Delta {
+                                text: text.to_string(),
+                            })
+                            .await;
                     }
                 }
 
@@ -249,7 +271,9 @@ impl LlmProvider for GeminiProvider {
                             entry.2.push_str(args);
                         }
                         // Gemini embeds thought_signature in extra_content.google
-                        if let Some(sig) = tc["extra_content"]["google"]["thought_signature"].as_str() {
+                        if let Some(sig) =
+                            tc["extra_content"]["google"]["thought_signature"].as_str()
+                        {
                             entry.3.get_or_insert_with(String::new).push_str(sig);
                         }
                     }
@@ -269,7 +293,10 @@ impl LlmProvider for GeminiProvider {
             let _ = tx.send(StreamChunk::ToolCallReady { call }).await;
         }
 
-        let usage = last_usage.unwrap_or(TokenUsage { input_tokens: 0, output_tokens: 0 });
+        let usage = last_usage.unwrap_or(TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        });
         let _ = tx.send(StreamChunk::Done { usage }).await;
 
         Ok(())

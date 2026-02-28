@@ -2,6 +2,8 @@ use crate::config::KrabsConfig;
 use crate::memory::MemoryStore;
 use crate::permissions::PermissionGuard;
 use crate::providers::provider::{LlmProvider, LlmResponse, Message, Role, StreamChunk};
+use crate::skills::registry::SkillRegistry;
+use crate::tools::read_skill::ReadSkillTool;
 use crate::tools::registry::ToolRegistry;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,6 +30,7 @@ pub struct KrabsAgent {
     pub memory: Box<dyn MemoryStore>,
     pub permissions: PermissionGuard,
     pub system_prompt: String,
+    pub skills: Option<Arc<SkillRegistry>>,
     total_input_tokens: std::sync::atomic::AtomicU32,
     total_output_tokens: std::sync::atomic::AtomicU32,
 }
@@ -39,6 +42,7 @@ pub struct KrabsAgentBuilder {
     memory: Box<dyn MemoryStore>,
     permissions: PermissionGuard,
     system_prompt: String,
+    skills: Option<Arc<SkillRegistry>>,
 }
 
 impl KrabsAgentBuilder {
@@ -50,6 +54,7 @@ impl KrabsAgentBuilder {
             memory: Box::new(crate::memory::memory::InMemoryStore::new()),
             permissions: PermissionGuard::new(),
             system_prompt: String::new(),
+            skills: None,
         }
     }
 
@@ -73,6 +78,13 @@ impl KrabsAgentBuilder {
         self
     }
 
+    pub fn skills(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.registry
+            .register(Arc::new(ReadSkillTool::new(Arc::clone(&registry))));
+        self.skills = Some(registry);
+        self
+    }
+
     pub fn build(self) -> Arc<KrabsAgent> {
         Arc::new(KrabsAgent {
             config: self.config,
@@ -81,6 +93,7 @@ impl KrabsAgentBuilder {
             memory: self.memory,
             permissions: self.permissions,
             system_prompt: self.system_prompt,
+            skills: self.skills,
             total_input_tokens: std::sync::atomic::AtomicU32::new(0),
             total_output_tokens: std::sync::atomic::AtomicU32::new(0),
         })
@@ -103,8 +116,25 @@ impl KrabsAgent {
             memory: Box::new(memory),
             permissions,
             system_prompt,
+            skills: None,
             total_input_tokens: std::sync::atomic::AtomicU32::new(0),
             total_output_tokens: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Sync skills from disk then return the full system prompt for this turn.
+    async fn current_system_prompt(&self) -> String {
+        match &self.skills {
+            None => self.system_prompt.clone(),
+            Some(registry) => {
+                registry.sync().await;
+                let section = registry.metadata_prompt().await;
+                if section.is_empty() {
+                    self.system_prompt.clone()
+                } else {
+                    format!("{}\n\n{}", self.system_prompt, section)
+                }
+            }
         }
     }
 
@@ -123,10 +153,7 @@ impl KrabsAgent {
         total / self.config.max_context_tokens as f32
     }
 
-    pub async fn run_streaming(
-        self: Arc<Self>,
-        task: &str,
-    ) -> Result<mpsc::Receiver<StreamChunk>> {
+    pub async fn run_streaming(self: Arc<Self>, task: &str) -> Result<mpsc::Receiver<StreamChunk>> {
         let (tx, rx) = mpsc::channel(64);
         let task = task.to_string();
         let agent = Arc::clone(&self);
@@ -151,9 +178,15 @@ impl KrabsAgent {
 
     async fn streaming_loop(&self, task: String, tx: mpsc::Sender<StreamChunk>) -> Result<()> {
         let tool_defs = self.registry.tool_defs();
-        let mut messages = vec![Message::system(&self.system_prompt), Message::user(task)];
+        let system_prompt = self.current_system_prompt().await;
+        let mut messages = vec![Message::system(&system_prompt), Message::user(task)];
 
         for turn in 0..self.config.max_turns {
+            // Sync skills and rebuild system message each turn to pick up
+            // any skills the user dropped in while the agent is running.
+            let system_prompt = self.current_system_prompt().await;
+            messages[0] = Message::system(&system_prompt);
+
             if self.context_used_pct() > 0.8 {
                 warn!(
                     "Context at {}%, trimming oldest messages",
@@ -187,7 +220,10 @@ impl KrabsAgent {
                         usage_this_turn = Some(usage.clone());
                     }
                 }
-                if matches!(chunk, StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. }) {
+                if matches!(
+                    chunk,
+                    StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. }
+                ) {
                     let _ = tx.send(chunk).await;
                 }
             }
@@ -266,11 +302,17 @@ impl Agent for KrabsAgent {
     async fn run(&self, task: &str) -> Result<AgentOutput> {
         let tool_defs = self.registry.tool_defs();
 
-        let mut messages = vec![Message::system(&self.system_prompt), Message::user(task)];
+        let system_prompt = self.current_system_prompt().await;
+        let mut messages = vec![Message::system(&system_prompt), Message::user(task)];
 
         let mut tool_calls_made = 0;
 
         for turn in 0..self.config.max_turns {
+            // Sync skills and rebuild system message each turn to pick up
+            // any skills the user dropped in while the agent is running.
+            let system_prompt = self.current_system_prompt().await;
+            messages[0] = Message::system(&system_prompt);
+
             if self.context_used_pct() > 0.8 {
                 warn!(
                     "Context at {}%, trimming oldest messages",

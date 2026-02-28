@@ -3,6 +3,27 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    #[serde(default = "default_skill_paths")]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub enabled: Vec<String>,
+}
+
+fn default_skill_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from("skills")]
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            paths: default_skill_paths(),
+            enabled: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KrabsConfig {
     #[serde(default = "default_model")]
     pub model: String,
@@ -16,6 +37,8 @@ pub struct KrabsConfig {
     pub db_path: PathBuf,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 fn default_model() -> String {
@@ -49,6 +72,7 @@ impl Default for KrabsConfig {
             max_turns: default_max_turns(),
             db_path: default_db_path(),
             max_context_tokens: default_max_context_tokens(),
+            skills: SkillsConfig::default(),
         }
     }
 }

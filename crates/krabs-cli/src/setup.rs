@@ -71,7 +71,11 @@ pub fn run_setup() -> Result<Credentials> {
         default_model
     } else {
         let m = read_line(&format!("Model [{}]: ", default_model))?;
-        if m.is_empty() { default_model } else { m }
+        if m.is_empty() {
+            default_model
+        } else {
+            m
+        }
     };
 
     let creds = Credentials {

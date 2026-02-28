@@ -1,14 +1,15 @@
 use anyhow::Result;
 use crossterm::{
+    event::DisableMouseCapture,
+    event::EnableMouseCapture,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    event::EnableMouseCapture,
-    event::DisableMouseCapture,
 };
 use krabs_core::{
-    BashTool, Credentials, GlobTool, GrepTool, LlmProvider, McpRegistry, Message, ReadTool,
-    StreamChunk, TokenUsage, ToolCall, ToolDef, ToolRegistry, WriteTool,
+    skills::loader::SkillLoader, BashTool, Credentials, GlobTool, GrepTool, KrabsConfig,
+    LlmProvider, McpRegistry, Message, ReadTool, SkillsConfig, StreamChunk, TokenUsage, ToolCall,
+    ToolDef, ToolRegistry, WriteTool,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -25,9 +26,9 @@ use tokio::sync::mpsc;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const SKILLS: &[(&str, &str)] = &[
+const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "list available tools"),
-    ("/skills", "list slash commands"),
+    ("/skills", "list project skills"),
     ("/mcp", "list connected MCP servers"),
     ("/usage", "show context window usage"),
     ("/clear", "clear screen and conversation"),
@@ -111,7 +112,9 @@ impl ChatMsg {
             ChatMsg::ToolCall(t) => vec![Line::from(vec![
                 Span::styled(
                     "  ⚙ ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(t.clone(), Style::default().fg(Color::Yellow)),
             ])],
@@ -147,10 +150,7 @@ impl ChatMsg {
             ],
             ChatMsg::Error(t) => vec![
                 Line::from(vec![
-                    Span::styled(
-                        " error ",
-                        Style::default().fg(Color::White).bg(Color::Red),
-                    ),
+                    Span::styled(" error ", Style::default().fg(Color::White).bg(Color::Red)),
                     Span::raw("  "),
                     Span::styled(t.clone(), Style::default().fg(Color::Red)),
                 ]),
@@ -263,11 +263,7 @@ fn extract_api_error(raw: &str) -> String {
             let obj: serde_json::Value = if v.is_array() { v[0].clone() } else { v };
             if let Some(msg) = obj["error"]["message"].as_str() {
                 // Trim after ". Please refer to" for brevity
-                let trimmed: &str = msg
-                    .split(". Please refer to")
-                    .next()
-                    .unwrap_or(msg)
-                    .trim();
+                let trimmed: &str = msg.split(". Please refer to").next().unwrap_or(msg).trim();
                 return format!("API error: {}", trimmed);
             }
         }
@@ -292,13 +288,20 @@ async fn run_turn(
     loop {
         iterations += 1;
         if iterations > 10 {
-            let _ = tx.send(DisplayEvent::Error("agentic loop exceeded 10 iterations — stopping".into())).await;
+            let _ = tx
+                .send(DisplayEvent::Error(
+                    "agentic loop exceeded 10 iterations — stopping".into(),
+                ))
+                .await;
             return;
         }
         let (inner_tx, mut inner_rx) = mpsc::channel::<StreamChunk>(64);
         let mut text = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
-        let mut usage = TokenUsage { input_tokens: 0, output_tokens: 0 };
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
         let mut got_done = false;
 
         let p2 = Arc::clone(&provider);
@@ -363,7 +366,11 @@ async fn run_turn(
                 None => krabs_core::ToolResult::err(format!("tool '{}' not found", call.name)),
             };
             let content = result.content.clone();
-            if tx.send(DisplayEvent::ToolResultEnd(content.clone())).await.is_err() {
+            if tx
+                .send(DisplayEvent::ToolResultEnd(content.clone()))
+                .await
+                .is_err()
+            {
                 return;
             }
             messages.push(Message::tool_result(&content, &call.id));
@@ -375,7 +382,7 @@ async fn run_turn(
 // ── slash suggestions ─────────────────────────────────────────────────────────
 
 fn slash_suggestions(prefix: &str) -> Vec<(&'static str, &'static str)> {
-    SKILLS
+    SLASH_COMMANDS
         .iter()
         .filter(|(cmd, _)| cmd.starts_with(prefix))
         .copied()
@@ -406,13 +413,28 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
     let used = app.total_input + app.total_output;
     let pct = (used as f32 / max_ctx as f32 * 100.0).min(100.0);
     let filled = (pct / 5.0).round() as usize;
-    let ctx_bar = format!("[{}{}] {:.1}%", "█".repeat(filled), "░".repeat(20 - filled), pct);
+    let ctx_bar = format!(
+        "[{}{}] {:.1}%",
+        "█".repeat(filled),
+        "░".repeat(20 - filled),
+        pct
+    );
     let info_lines = vec![
         Line::from(vec![
             Span::styled("  provider  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&info.provider, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &info.provider,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("   model  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&info.model, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &info.model,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  cwd     ", Style::default().fg(Color::DarkGray)),
@@ -431,7 +453,12 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(MR_KRABS_ORANGE))
-            .title(Span::styled(" krabs ", Style::default().fg(MR_KRABS_ORANGE).add_modifier(Modifier::BOLD))),
+            .title(Span::styled(
+                " krabs ",
+                Style::default()
+                    .fg(MR_KRABS_ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            )),
     );
     frame.render_widget(info_widget, chunks[0]);
 
@@ -552,10 +579,20 @@ fn cmd_tools(app: &mut App, registry: &ToolRegistry) {
     }
 }
 
-fn cmd_skills(app: &mut App) {
-    app.push(ChatMsg::Info("slash commands:".into()));
-    for (cmd, desc) in SKILLS {
-        app.push(ChatMsg::Info(format!("  {:10}  {}", cmd, desc)));
+fn cmd_skills(app: &mut App, skills_config: &SkillsConfig) {
+    let skills = SkillLoader::discover(skills_config);
+    if skills.is_empty() {
+        app.push(ChatMsg::Info(
+            "no skills found — add skill directories under skills/".into(),
+        ));
+    } else {
+        app.push(ChatMsg::Info(format!("{} skill(s):", skills.len())));
+        for s in &skills {
+            app.push(ChatMsg::Info(format!(
+                "  {:20}  {}",
+                s.name, s.description
+            )));
+        }
     }
 }
 
@@ -580,8 +617,14 @@ fn cmd_usage(app: &mut App, max_ctx: u32) {
     let filled = (pct / 5.0).round() as usize;
     let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(20 - filled));
     app.push(ChatMsg::Info(format!("context  {bar}  {pct:.1}%")));
-    app.push(ChatMsg::Info(format!("input    {} tokens", app.total_input)));
-    app.push(ChatMsg::Info(format!("output   {} tokens", app.total_output)));
+    app.push(ChatMsg::Info(format!(
+        "input    {} tokens",
+        app.total_input
+    )));
+    app.push(ChatMsg::Info(format!(
+        "output   {} tokens",
+        app.total_output
+    )));
     app.push(ChatMsg::Info(format!(
         "total    {} / {} tokens",
         used, max_ctx
@@ -627,11 +670,19 @@ async fn show_splash(
 
             let x = area.width.saturating_sub(box_w) / 2;
             let y = area.height.saturating_sub(box_h) / 2;
-            let rect = ratatui::layout::Rect::new(x, y, box_w.min(area.width), box_h.min(area.height));
+            let rect =
+                ratatui::layout::Rect::new(x, y, box_w.min(area.width), box_h.min(area.height));
 
             let mut lines: Vec<Line> = LOGO
                 .iter()
-                .map(|row| Line::from(Span::styled(*row, Style::default().fg(MR_KRABS_ORANGE).add_modifier(Modifier::BOLD))))
+                .map(|row| {
+                    Line::from(Span::styled(
+                        *row,
+                        Style::default()
+                            .fg(MR_KRABS_ORANGE)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                })
                 .collect();
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -646,7 +697,12 @@ async fn show_splash(
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MR_KRABS_ORANGE))
-                .title(Span::styled(" krabs ", Style::default().fg(MR_KRABS_ORANGE).add_modifier(Modifier::BOLD)));
+                .title(Span::styled(
+                    " krabs ",
+                    Style::default()
+                        .fg(MR_KRABS_ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                ));
 
             let para = Paragraph::new(lines)
                 .block(block)
@@ -656,7 +712,9 @@ async fn show_splash(
         })?;
 
         if let Ok(Event::Key(k)) = key_rx.try_recv() {
-            if k.kind == KeyEventKind::Press { break; }
+            if k.kind == KeyEventKind::Press {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -666,6 +724,7 @@ async fn show_splash(
 // ── main entry ───────────────────────────────────────────────────────────────
 
 pub async fn run(creds: Credentials) -> Result<()> {
+    let krabs_config = KrabsConfig::load().unwrap_or_default();
     let provider: Arc<dyn LlmProvider> = Arc::from(creds.build_provider());
     let registry = Arc::new(build_registry());
     let tool_defs = registry.tool_defs();
@@ -900,7 +959,7 @@ pub async fn run(creds: Credentials) -> Result<()> {
                                 app.total_output = 0;
                             }
                             "/tools"  => cmd_tools(&mut app, &registry),
-                            "/skills" => cmd_skills(&mut app),
+                            "/skills" => cmd_skills(&mut app, &krabs_config.skills),
                             "/mcp"    => cmd_mcp(&mut app).await,
                             "/usage"  => cmd_usage(&mut app, max_ctx),
                             _ => {
