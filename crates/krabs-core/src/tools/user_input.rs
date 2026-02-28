@@ -1,10 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use krabs_core::tools::tool::{Tool, ToolResult};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-// ── request types (shared with chat.rs) ─────────────────────────────────────
+use crate::tools::tool::{Tool, ToolResult};
+
+// ── request types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
@@ -22,7 +23,7 @@ pub struct UserInputRequest {
     pub respond: oneshot::Sender<String>,
 }
 
-// ── tool ─────────────────────────────────────────────────────────────────────
+// ── tool ──────────────────────────────────────────────────────────────────────
 
 /// A tool that pauses the agent and asks the user a structured question.
 ///

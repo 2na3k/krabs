@@ -209,9 +209,7 @@ impl Tool for DispatchTool {
                     ));
                 }
                 Ok((profile_name, task, Err(e))) => {
-                    sections.push(format!(
-                        "### [{idx}] {profile_name} — {task}\n[ERROR] {e}"
-                    ));
+                    sections.push(format!("### [{idx}] {profile_name} — {task}\n[ERROR] {e}"));
                 }
                 Err(join_err) => {
                     sections.push(format!("### [{idx}] task panicked: {join_err}"));

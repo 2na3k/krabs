@@ -1,6 +1,5 @@
 mod chat;
 mod setup;
-mod user_input;
 
 use anyhow::Result;
 use krabs_core::Credentials;

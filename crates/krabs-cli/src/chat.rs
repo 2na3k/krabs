@@ -1,4 +1,3 @@
-use crate::user_input::{InputMode, UserInputRequest, UserInputTool};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -11,6 +10,7 @@ use krabs_core::{
     LlmProvider, McpRegistry, McpServer, Message, ReadTool, Role, SkillsConfig, StreamChunk,
     TokenUsage, ToolCall, ToolRegistry, WriteTool,
 };
+use krabs_core::{InputMode, UserInputRequest, UserInputTool};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -101,7 +101,7 @@ async fn load_resume_history(
     config: &KrabsConfig,
     session_id: &str,
 ) -> (Vec<Message>, Vec<ChatMsg>) {
-    use krabs_core::{SessionStore, session::session::Session as KrabsSession};
+    use krabs_core::{session::session::Session as KrabsSession, SessionStore};
 
     let store = match SessionStore::open(&config.db_path).await {
         Ok(s) => s,
@@ -115,7 +115,10 @@ async fn load_resume_history(
     let stored = match session.latest_checkpoint().await {
         Ok(Some(cp)) => {
             let _ = session.rollback_to(cp.last_msg_id).await;
-            session.messages_up_to(cp.last_msg_id).await.unwrap_or_default()
+            session
+                .messages_up_to(cp.last_msg_id)
+                .await
+                .unwrap_or_default()
         }
         _ => session.messages().await.unwrap_or_default(),
     };

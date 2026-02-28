@@ -1,10 +1,10 @@
 use crate::providers::provider::{Message, Role, ToolCall};
-#[cfg(test)]
-use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -295,12 +295,11 @@ impl Session {
     /// all messages written up to this point are considered consistent and safe
     /// to resume from.
     pub async fn write_checkpoint(&self, turn: usize) -> Result<()> {
-        let row = sqlx::query(
-            "SELECT COALESCE(MAX(id), 0) as max_id FROM messages WHERE session_id = ?",
-        )
-        .bind(&self.id)
-        .fetch_one(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT COALESCE(MAX(id), 0) as max_id FROM messages WHERE session_id = ?")
+                .bind(&self.id)
+                .fetch_one(&self.pool)
+                .await?;
 
         let last_msg_id: i64 = row.try_get("max_id")?;
 
@@ -671,11 +670,21 @@ mod tests {
             .unwrap();
 
         // Turn 0: user + assistant (complete)
-        session.persist_message(&Message::user("hello"), 0).await.unwrap();
-        session.persist_message(&Message::assistant("hi!"), 0).await.unwrap();
+        session
+            .persist_message(&Message::user("hello"), 0)
+            .await
+            .unwrap();
+        session
+            .persist_message(&Message::assistant("hi!"), 0)
+            .await
+            .unwrap();
         session.write_checkpoint(0).await.unwrap();
 
-        let cp = session.latest_checkpoint().await.unwrap().expect("checkpoint exists");
+        let cp = session
+            .latest_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint exists");
         assert_eq!(cp.turn, 0);
         let checkpoint_msg_id = cp.last_msg_id;
 
@@ -721,7 +730,10 @@ mod tests {
             args: serde_json::json!({ "path": "/tmp/x" }),
             thought_signature: None,
         };
-        session.persist_message(&Message::user("hello"), 0).await.unwrap();
+        session
+            .persist_message(&Message::user("hello"), 0)
+            .await
+            .unwrap();
         session
             .persist_message(&Message::assistant_tool_calls(vec![call.clone()]), 1)
             .await
@@ -744,7 +756,10 @@ mod tests {
         assert!(matches!(reconstructed[0].role, Role::User));
         assert!(matches!(reconstructed[1].role, Role::Assistant));
         assert!(reconstructed[1].tool_calls.is_some());
-        assert_eq!(reconstructed[1].tool_calls.as_ref().unwrap()[0].name, "read");
+        assert_eq!(
+            reconstructed[1].tool_calls.as_ref().unwrap()[0].name,
+            "read"
+        );
         assert!(matches!(reconstructed[2].role, Role::Tool));
         assert_eq!(reconstructed[2].tool_call_id.as_deref(), Some("t1"));
         assert!(matches!(reconstructed[3].role, Role::Assistant));
@@ -762,9 +777,18 @@ mod tests {
             .await
             .unwrap();
 
-        session.persist_message(&Message::user("tell me about Rust"), 0).await.unwrap();
-        session.persist_message(&Message::assistant("Rust is a systems language."), 1).await.unwrap();
-        session.persist_message(&Message::user("what about Python?"), 2).await.unwrap();
+        session
+            .persist_message(&Message::user("tell me about Rust"), 0)
+            .await
+            .unwrap();
+        session
+            .persist_message(&Message::assistant("Rust is a systems language."), 1)
+            .await
+            .unwrap();
+        session
+            .persist_message(&Message::user("what about Python?"), 2)
+            .await
+            .unwrap();
 
         assert_eq!(session.search("Rust").await.unwrap().len(), 2);
         assert_eq!(session.search("Python").await.unwrap().len(), 1);

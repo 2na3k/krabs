@@ -85,7 +85,9 @@ impl KrabsAgentBuilder {
     /// Resume a previously persisted session rather than creating a new one.
     /// All new messages will be appended under the original session ID.
     pub fn resume_session(mut self, session_id: impl Into<String>) -> Self {
-        self.resume_mode = ResumeMode::Resume { session_id: session_id.into() };
+        self.resume_mode = ResumeMode::Resume {
+            session_id: session_id.into(),
+        };
         self
     }
 
@@ -148,9 +150,7 @@ impl KrabsAgentBuilder {
                             .new_session(&self.agent_id, &self.config.model, &provider_name)
                             .await
                     }
-                    ResumeMode::Resume { session_id } => {
-                        store.load_session(session_id).await
-                    }
+                    ResumeMode::Resume { session_id } => store.load_session(session_id).await,
                 };
                 match result {
                     Ok(s) => {
@@ -170,7 +170,10 @@ impl KrabsAgentBuilder {
                 }
             }
             Err(e) => {
-                warn!("Failed to open session store at {:?}: {e}", self.config.db_path);
+                warn!(
+                    "Failed to open session store at {:?}: {e}",
+                    self.config.db_path
+                );
                 None
             }
         };
@@ -348,7 +351,13 @@ impl KrabsAgent {
         }
     }
 
-    async fn persist_error(&self, turn: usize, context: &str, error: &anyhow::Error, attempt: usize) {
+    async fn persist_error(
+        &self,
+        turn: usize,
+        context: &str,
+        error: &anyhow::Error,
+        attempt: usize,
+    ) {
         if let Some(s) = &self.session {
             if let Err(e) = s.persist_error(turn, context, error, attempt).await {
                 warn!("Failed to persist error: {e}");
@@ -633,11 +642,8 @@ impl KrabsAgent {
                                             tool_use_id: call.id.clone(),
                                         })
                                         .await;
-                                    let result_msg = Message::tool_result(
-                                        e.to_string(),
-                                        &call.id,
-                                        &call.name,
-                                    );
+                                    let result_msg =
+                                        Message::tool_result(e.to_string(), &call.id, &call.name);
                                     self.persist_message(&result_msg, turn).await;
                                     messages.push(result_msg);
                                 }
@@ -672,7 +678,8 @@ impl KrabsAgent {
         }
 
         let e = anyhow::anyhow!("Max turns ({}) exceeded", self.config.max_turns);
-        self.persist_error(self.config.max_turns, "max_turns", &e, 0).await;
+        self.persist_error(self.config.max_turns, "max_turns", &e, 0)
+            .await;
         Err(e)
     }
 
@@ -805,8 +812,7 @@ impl Agent for KrabsAgent {
                             HookOutput::ToolDecision(ToolUseDecision::Deny { reason }) => {
                                 let msg = format!("Tool call denied by hook: {}", reason);
                                 warn!("{}", msg);
-                                let result_msg =
-                                    Message::tool_result(&msg, &call.id, &call.name);
+                                let result_msg = Message::tool_result(&msg, &call.id, &call.name);
                                 self.persist_message(&result_msg, turn).await;
                                 messages.push(result_msg);
                                 continue;
@@ -837,9 +843,8 @@ impl Agent for KrabsAgent {
                                         } else {
                                             result.content
                                         };
-                                        let result_msg = Message::tool_result(
-                                            &content, &call.id, &call.name,
-                                        );
+                                        let result_msg =
+                                            Message::tool_result(&content, &call.id, &call.name);
                                         self.persist_message(&result_msg, turn).await;
                                         messages.push(result_msg);
                                     }
@@ -865,8 +870,7 @@ impl Agent for KrabsAgent {
                             None => {
                                 let msg = format!("Tool not found: {}", call.name);
                                 warn!("{}", msg);
-                                let result_msg =
-                                    Message::tool_result(&msg, &call.id, &call.name);
+                                let result_msg = Message::tool_result(&msg, &call.id, &call.name);
                                 self.persist_message(&result_msg, turn).await;
                                 messages.push(result_msg);
                             }
@@ -880,7 +884,8 @@ impl Agent for KrabsAgent {
         }
 
         let e = anyhow::anyhow!("Max turns ({}) exceeded", self.config.max_turns);
-        self.persist_error(self.config.max_turns, "max_turns", &e, 0).await;
+        self.persist_error(self.config.max_turns, "max_turns", &e, 0)
+            .await;
         Err(e)
     }
 }
