@@ -19,8 +19,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::{io, sync::Arc, time::Duration};
-use tokio::sync::mpsc;
+use std::{collections::HashSet, io, sync::Arc, time::Duration};
+use tokio::sync::{mpsc, oneshot};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -172,11 +172,24 @@ impl ChatMsg {
 
 enum DisplayEvent {
     Token(String),
+    /// Sent before a tool runs; background task waits on `respond`.
+    PermissionRequest {
+        tool_name: String,
+        args: String,
+        respond: oneshot::Sender<bool>,
+    },
     ToolCallStart(ToolCall),
     ToolResultEnd(String),
     TurnUsage(TokenUsage),
     Done(Vec<Message>),
     Error(String),
+}
+
+/// Active permission prompt waiting for a user keypress.
+struct PendingPermission {
+    tool_name: String,
+    args: String,
+    respond: oneshot::Sender<bool>,
 }
 
 // ── app state ────────────────────────────────────────────────────────────────
@@ -196,6 +209,10 @@ struct App {
     suggest_idx: Option<usize>, // selected index in suggestion popup
     active_persona: Option<AgentPersona>,
     personas: Vec<AgentPersona>,
+    /// Tools approved with "always allow" — no prompt on subsequent calls.
+    approved_tools: HashSet<String>,
+    /// Active permission prompt waiting for y / a / n keypress.
+    pending_permission: Option<PendingPermission>,
 }
 
 impl App {
@@ -215,6 +232,8 @@ impl App {
             total_output: 0,
             active_persona: None,
             personas: Vec::new(),
+            approved_tools: HashSet::new(),
+            pending_permission: None,
         }
     }
 
@@ -370,6 +389,35 @@ async fn run_turn(
 
         // execute tool calls
         for call in calls {
+            // Ask the UI for permission before running the tool
+            let (permit_tx, permit_rx) = oneshot::channel::<bool>();
+            let args_display = serde_json::to_string(&call.args).unwrap_or_default();
+            if tx
+                .send(DisplayEvent::PermissionRequest {
+                    tool_name: call.name.clone(),
+                    args: args_display,
+                    respond: permit_tx,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Block until the user decides (or stream is cancelled)
+            let allowed = permit_rx.await.unwrap_or(false);
+            if !allowed {
+                let msg = format!("tool '{}' denied by user", call.name);
+                if tx
+                    .send(DisplayEvent::ToolResultEnd(msg.clone()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                messages.push(Message::tool_result(&msg, &call.id));
+                continue;
+            }
+
             let result = match registry.get(&call.name) {
                 Some(tool) => match tool.call(call.args.clone()).await {
                     Ok(r) => r,
@@ -632,6 +680,60 @@ fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
             frame.render_widget(ratatui::widgets::Clear, pop_rect);
             frame.render_widget(popup, pop_rect);
         }
+    }
+
+    // ── Permission dialog ──────────────────────────────────────────────────────
+    if let Some(ref perm) = app.pending_permission {
+        let pop_w = (area.width * 3 / 4).clamp(40, 72);
+        let pop_h = 7u16;
+        let pop_x = area.x + (area.width.saturating_sub(pop_w)) / 2;
+        let pop_y = area.y + (area.height.saturating_sub(pop_h)) / 2;
+        let pop_rect = ratatui::layout::Rect::new(pop_x, pop_y, pop_w, pop_h);
+
+        // Truncate args to fit in the dialog width
+        let max_arg_len = (pop_w as usize).saturating_sub(6);
+        let args_display = if perm.args.len() > max_arg_len {
+            format!("{}…", &perm.args[..max_arg_len.saturating_sub(1)])
+        } else {
+            perm.args.clone()
+        };
+
+        let perm_lines = vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  tool  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    perm.tool_name.clone(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  args  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(args_display, Style::default().fg(Color::White)),
+            ]),
+            Line::raw(""),
+            Line::from(vec![Span::styled(
+                "  [y] allow once   [a] always allow   [n] deny",
+                Style::default().fg(Color::Cyan),
+            )]),
+        ];
+
+        let perm_widget = Paragraph::new(perm_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Span::styled(
+                    " ⚠ tool permission ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        );
+
+        frame.render_widget(ratatui::widgets::Clear, pop_rect);
+        frame.render_widget(perm_widget, pop_rect);
     }
 
     // @<name> suggestion popup
@@ -1091,7 +1193,9 @@ pub async fn run(creds: Credentials) -> Result<()> {
 
                 // Ctrl+C: cancel turn if running, quit if idle
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    if app.spinning || stream_rx.is_some() {
+                    if app.pending_permission.is_some() || app.spinning || stream_rx.is_some() {
+                        // Deny any pending permission prompt (dropping sender signals false to task)
+                        app.pending_permission = None;
                         if let Some(h) = turn_handle.take() { h.abort(); }
                         stream_rx = None;
                         app.spinning = false;
@@ -1190,6 +1294,42 @@ pub async fn run(creds: Credentials) -> Result<()> {
                         continue 'main;
                     }
                     _ => {}
+                }
+
+                // ── Permission prompt: intercept y / a / n ────────────────────
+                if app.pending_permission.is_some() {
+                    match key.code {
+                        // Allow once
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            if let Some(p) = app.pending_permission.take() {
+                                app.push(ChatMsg::Info(format!("  ✓ allowed: {}", p.tool_name)));
+                                let _ = p.respond.send(true);
+                                app.spinning = true;
+                            }
+                        }
+                        // Allow always (add to approved set)
+                        KeyCode::Char('a') => {
+                            if let Some(p) = app.pending_permission.take() {
+                                app.approved_tools.insert(p.tool_name.clone());
+                                app.push(ChatMsg::Info(format!(
+                                    "  ✓ always allow: {}",
+                                    p.tool_name
+                                )));
+                                let _ = p.respond.send(true);
+                                app.spinning = true;
+                            }
+                        }
+                        // Deny
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            if let Some(p) = app.pending_permission.take() {
+                                app.push(ChatMsg::Info(format!("  ✗ denied: {}", p.tool_name)));
+                                let _ = p.respond.send(false);
+                                app.spinning = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue 'main;
                 }
 
                 // Ignore editing while busy
@@ -1420,6 +1560,19 @@ pub async fn run(creds: Credentials) -> Result<()> {
                             _ => app.chat.push(ChatMsg::Assistant(t)),
                         }
                         if app.auto_scroll { app.scroll = u16::MAX; }
+                    }
+                    Some(DisplayEvent::PermissionRequest { tool_name, args, respond }) => {
+                        app.spinning = false;
+                        // Auto-allow tools the user already approved as "always allow"
+                        if app.approved_tools.contains(&tool_name) {
+                            let _ = respond.send(true);
+                        } else {
+                            app.pending_permission = Some(PendingPermission {
+                                tool_name,
+                                args,
+                                respond,
+                            });
+                        }
                     }
                     Some(DisplayEvent::ToolCallStart(call)) => {
                         app.spinning = false;
