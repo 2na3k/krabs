@@ -7,9 +7,9 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use krabs_core::{
-    skills::loader::SkillLoader, BashTool, Credentials, GlobTool, GrepTool, KrabsConfig,
-    LlmProvider, McpRegistry, Message, ReadTool, SkillsConfig, StreamChunk, TokenUsage, ToolCall,
-    ToolDef, ToolRegistry, WriteTool,
+    skills::loader::SkillLoader, BashTool, Credentials, GlobTool, GrepTool, HookConfig, HookEntry,
+    KrabsConfig, LlmProvider, McpRegistry, Message, ReadTool, SkillsConfig, StreamChunk,
+    TokenUsage, ToolCall, ToolDef, ToolRegistry, WriteTool,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -30,6 +30,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "list available tools"),
     ("/skills", "list project skills"),
     ("/mcp", "list connected MCP servers"),
+    (
+        "/hooks",
+        "list/add/remove hooks  usage: /hooks [list|add|remove]",
+    ),
     ("/usage", "show context window usage"),
     ("/clear", "clear screen and conversation"),
     ("/quit", "exit Krabs"),
@@ -588,10 +592,7 @@ fn cmd_skills(app: &mut App, skills_config: &SkillsConfig) {
     } else {
         app.push(ChatMsg::Info(format!("{} skill(s):", skills.len())));
         for s in &skills {
-            app.push(ChatMsg::Info(format!(
-                "  {:20}  {}",
-                s.name, s.description
-            )));
+            app.push(ChatMsg::Info(format!("  {:20}  {}", s.name, s.description)));
         }
     }
 }
@@ -609,6 +610,106 @@ async fn cmd_mcp(app: &mut App) {
             app.push(ChatMsg::Info(format!("  {} {:20}  {}", dot, s.name, s.url)));
         }
     }
+}
+
+/// /hooks [list]
+/// /hooks add <name> <event> [matcher] [action] [reason…]
+/// /hooks remove <name>
+///
+/// event   : AgentStart | AgentStop | TurnStart | TurnEnd |
+///           PreToolUse | PostToolUse | PostToolUseFailure
+/// action  : deny | stop | log  (default: log)
+fn cmd_hooks(app: &mut App, args: &str) {
+    let mut config = HookConfig::load();
+    let parts: Vec<&str> = args.split_whitespace().collect();
+
+    match parts.as_slice() {
+        // /hooks  or  /hooks list
+        [] | ["list"] => {
+            if config.hooks.is_empty() {
+                app.push(ChatMsg::Info(
+                    "no hooks configured — use /hooks add <name> <event> [matcher] [action] [reason]".into(),
+                ));
+            } else {
+                app.push(ChatMsg::Info(format!("{} hook(s):", config.hooks.len())));
+                for h in &config.hooks {
+                    let matcher = h.matcher.as_deref().unwrap_or("*");
+                    let reason = h.reason.as_deref().unwrap_or("");
+                    app.push(ChatMsg::Info(format!(
+                        "  {:20}  event={:<22}  matcher={:<12}  action={:<6}  {}",
+                        h.name, h.event, matcher, h.action, reason,
+                    )));
+                }
+            }
+        }
+
+        // /hooks add <name> <event> [matcher] [action] [reason…]
+        ["add", name, event, rest @ ..] => {
+            let (matcher, action, reason) = parse_hook_rest(rest);
+            let entry = HookEntry {
+                name: name.to_string(),
+                event: event.to_string(),
+                matcher,
+                action,
+                reason,
+            };
+            config.add(entry);
+            match config.save() {
+                Ok(()) => app.push(ChatMsg::Info(format!("hook '{}' saved", name))),
+                Err(e) => app.push(ChatMsg::Error(format!("failed to save hook: {e}"))),
+            }
+        }
+
+        // /hooks remove <name>
+        ["remove", name] => {
+            if config.remove(name) {
+                match config.save() {
+                    Ok(()) => app.push(ChatMsg::Info(format!("hook '{}' removed", name))),
+                    Err(e) => app.push(ChatMsg::Error(format!("failed to save: {e}"))),
+                }
+            } else {
+                app.push(ChatMsg::Error(format!("hook '{}' not found", name)));
+            }
+        }
+
+        _ => {
+            app.push(ChatMsg::Error(
+                "usage: /hooks [list]  |  /hooks add <name> <event> [matcher] [action] [reason]  |  /hooks remove <name>".into(),
+            ));
+        }
+    }
+}
+
+/// Parse the trailing `[matcher] [action] [reason…]` tokens.
+/// matcher — any token that is not a known action keyword
+/// action  — deny | stop | log  (default: log)
+/// reason  — remaining tokens joined by space
+fn parse_hook_rest(rest: &[&str]) -> (Option<String>, String, Option<String>) {
+    const ACTIONS: &[&str] = &["deny", "stop", "log"];
+    let mut matcher: Option<String> = None;
+    let mut action = "log".to_string();
+    let mut reason_parts: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i];
+        if ACTIONS.contains(&tok) {
+            action = tok.to_string();
+            reason_parts.extend_from_slice(&rest[i + 1..]);
+            break;
+        } else if matcher.is_none() {
+            matcher = Some(tok.to_string());
+        } else {
+            // unexpected token before action — treat rest as reason
+            reason_parts.push(tok);
+        }
+        i += 1;
+    }
+    let reason = if reason_parts.is_empty() {
+        None
+    } else {
+        Some(reason_parts.join(" "))
+    };
+    (matcher, action, reason)
 }
 
 fn cmd_usage(app: &mut App, max_ctx: u32) {
@@ -962,6 +1063,10 @@ pub async fn run(creds: Credentials) -> Result<()> {
                             "/skills" => cmd_skills(&mut app, &krabs_config.skills),
                             "/mcp"    => cmd_mcp(&mut app).await,
                             "/usage"  => cmd_usage(&mut app, max_ctx),
+                            s if s == "/hooks" || s.starts_with("/hooks ") => {
+                                let args = s.strip_prefix("/hooks").unwrap_or("").trim();
+                                cmd_hooks(&mut app, args);
+                            }
                             _ => {
                                 app.push(ChatMsg::User(input.clone()));
                                 messages.push(Message::user(&input));

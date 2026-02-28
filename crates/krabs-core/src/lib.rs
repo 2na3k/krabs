@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod config;
+pub mod hooks;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;
@@ -12,6 +13,9 @@ pub mod tools;
 pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
 pub use config::config::{KrabsConfig, SkillsConfig};
 pub use config::credentials::Credentials;
+pub use hooks::{
+    Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, ToolUseDecision,
+};
 pub use mcp::mcp::{McpRegistry, McpServer};
 pub use providers::provider::{
     LlmProvider, LlmResponse, Message, Role, StreamChunk, TokenUsage, ToolCall,

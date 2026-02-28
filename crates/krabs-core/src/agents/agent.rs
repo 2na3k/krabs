@@ -1,4 +1,6 @@
 use crate::config::KrabsConfig;
+use crate::hooks::hook::{HookEvent, HookOutput, ToolUseDecision};
+use crate::hooks::registry::HookRegistry;
 use crate::memory::MemoryStore;
 use crate::permissions::PermissionGuard;
 use crate::providers::provider::{LlmProvider, LlmResponse, Message, Role, StreamChunk};
@@ -31,6 +33,7 @@ pub struct KrabsAgent {
     pub permissions: PermissionGuard,
     pub system_prompt: String,
     pub skills: Option<Arc<SkillRegistry>>,
+    pub hooks: HookRegistry,
     total_input_tokens: std::sync::atomic::AtomicU32,
     total_output_tokens: std::sync::atomic::AtomicU32,
 }
@@ -43,6 +46,7 @@ pub struct KrabsAgentBuilder {
     permissions: PermissionGuard,
     system_prompt: String,
     skills: Option<Arc<SkillRegistry>>,
+    hooks: HookRegistry,
 }
 
 impl KrabsAgentBuilder {
@@ -55,6 +59,7 @@ impl KrabsAgentBuilder {
             permissions: PermissionGuard::new(),
             system_prompt: String::new(),
             skills: None,
+            hooks: HookRegistry::default(),
         }
     }
 
@@ -85,6 +90,11 @@ impl KrabsAgentBuilder {
         self
     }
 
+    pub fn hook(mut self, hook: Arc<dyn crate::hooks::hook::Hook>) -> Self {
+        self.hooks.register(hook);
+        self
+    }
+
     pub fn build(self) -> Arc<KrabsAgent> {
         Arc::new(KrabsAgent {
             config: self.config,
@@ -94,6 +104,7 @@ impl KrabsAgentBuilder {
             permissions: self.permissions,
             system_prompt: self.system_prompt,
             skills: self.skills,
+            hooks: self.hooks,
             total_input_tokens: std::sync::atomic::AtomicU32::new(0),
             total_output_tokens: std::sync::atomic::AtomicU32::new(0),
         })
@@ -117,6 +128,7 @@ impl KrabsAgent {
             permissions,
             system_prompt,
             skills: None,
+            hooks: HookRegistry::default(),
             total_input_tokens: std::sync::atomic::AtomicU32::new(0),
             total_output_tokens: std::sync::atomic::AtomicU32::new(0),
         }
@@ -178,14 +190,19 @@ impl KrabsAgent {
 
     async fn streaming_loop(&self, task: String, tx: mpsc::Sender<StreamChunk>) -> Result<()> {
         let tool_defs = self.registry.tool_defs();
+
+        self.hooks
+            .fire(&HookEvent::AgentStart { task: task.clone() })
+            .await;
+
         let system_prompt = self.current_system_prompt().await;
         let mut messages = vec![Message::system(&system_prompt), Message::user(task)];
 
         for turn in 0..self.config.max_turns {
-            // Sync skills and rebuild system message each turn to pick up
-            // any skills the user dropped in while the agent is running.
             let system_prompt = self.current_system_prompt().await;
             messages[0] = Message::system(&system_prompt);
+
+            self.hooks.fire(&HookEvent::TurnStart { turn }).await;
 
             if self.context_used_pct() > 0.8 {
                 warn!(
@@ -249,18 +266,71 @@ impl KrabsAgent {
                     .join(", ");
                 messages.push(Message::assistant(calls_summary));
 
-                for call in tool_calls_this_turn {
+                for mut call in tool_calls_this_turn {
                     if !self.permissions.is_allowed(&call.name) {
                         let msg = format!("Permission denied for tool: {}", call.name);
                         warn!("{}", msg);
                         messages.push(Message::tool_result(&msg, &call.id));
                         continue;
                     }
+
+                    // PreToolUse hook
+                    let pre = self
+                        .hooks
+                        .fire(&HookEvent::PreToolUse {
+                            tool_name: call.name.clone(),
+                            args: call.args.clone(),
+                            tool_use_id: call.id.clone(),
+                        })
+                        .await;
+
+                    match pre {
+                        HookOutput::ToolDecision(ToolUseDecision::Deny { reason }) => {
+                            let msg = format!("Tool call denied by hook: {}", reason);
+                            warn!("{}", msg);
+                            messages.push(Message::tool_result(&msg, &call.id));
+                            continue;
+                        }
+                        HookOutput::ToolDecision(ToolUseDecision::ModifyArgs { args }) => {
+                            debug!("Hook modified args for tool: {}", call.name);
+                            call.args = args;
+                        }
+                        _ => {}
+                    }
+
                     match self.registry.get(&call.name) {
                         Some(tool) => {
                             debug!("Calling tool: {} with args: {}", call.name, call.args);
-                            let result = tool.call(call.args).await?;
-                            messages.push(Message::tool_result(&result.content, &call.id));
+                            match tool.call(call.args.clone()).await {
+                                Ok(result) => {
+                                    let post = self
+                                        .hooks
+                                        .fire(&HookEvent::PostToolUse {
+                                            tool_name: call.name.clone(),
+                                            args: call.args.clone(),
+                                            result: result.content.clone(),
+                                            tool_use_id: call.id.clone(),
+                                        })
+                                        .await;
+                                    let content = if let HookOutput::AppendContext(ctx) = post {
+                                        format!("{}\n{}", result.content, ctx)
+                                    } else {
+                                        result.content
+                                    };
+                                    messages.push(Message::tool_result(&content, &call.id));
+                                }
+                                Err(e) => {
+                                    self.hooks
+                                        .fire(&HookEvent::PostToolUseFailure {
+                                            tool_name: call.name.clone(),
+                                            args: call.args.clone(),
+                                            error: e.to_string(),
+                                            tool_use_id: call.id.clone(),
+                                        })
+                                        .await;
+                                    messages.push(Message::tool_result(e.to_string(), &call.id));
+                                }
+                            }
                         }
                         None => {
                             let msg = format!("Tool not found: {}", call.name);
@@ -269,9 +339,17 @@ impl KrabsAgent {
                         }
                     }
                 }
+
+                self.hooks.fire(&HookEvent::TurnEnd { turn }).await;
             } else {
                 info!("Stream turn {}: final message received", turn);
                 messages.push(Message::assistant(&delta_content));
+                self.hooks.fire(&HookEvent::TurnEnd { turn }).await;
+                self.hooks
+                    .fire(&HookEvent::AgentStop {
+                        result: delta_content,
+                    })
+                    .await;
                 return Ok(());
             }
         }
@@ -302,16 +380,22 @@ impl Agent for KrabsAgent {
     async fn run(&self, task: &str) -> Result<AgentOutput> {
         let tool_defs = self.registry.tool_defs();
 
+        self.hooks
+            .fire(&HookEvent::AgentStart {
+                task: task.to_string(),
+            })
+            .await;
+
         let system_prompt = self.current_system_prompt().await;
         let mut messages = vec![Message::system(&system_prompt), Message::user(task)];
 
         let mut tool_calls_made = 0;
 
         for turn in 0..self.config.max_turns {
-            // Sync skills and rebuild system message each turn to pick up
-            // any skills the user dropped in while the agent is running.
             let system_prompt = self.current_system_prompt().await;
             messages[0] = Message::system(&system_prompt);
+
+            self.hooks.fire(&HookEvent::TurnStart { turn }).await;
 
             if self.context_used_pct() > 0.8 {
                 warn!(
@@ -339,6 +423,12 @@ impl Agent for KrabsAgent {
                     self.total_output_tokens
                         .fetch_add(usage.output_tokens, std::sync::atomic::Ordering::Relaxed);
                     messages.push(Message::assistant(&content));
+                    self.hooks.fire(&HookEvent::TurnEnd { turn }).await;
+                    self.hooks
+                        .fire(&HookEvent::AgentStop {
+                            result: content.clone(),
+                        })
+                        .await;
                     return Ok(AgentOutput {
                         result: content,
                         tool_calls_made,
@@ -358,7 +448,7 @@ impl Agent for KrabsAgent {
                         .join(", ");
                     messages.push(Message::assistant(calls_summary));
 
-                    for call in calls {
+                    for mut call in calls {
                         tool_calls_made += 1;
 
                         if !self.permissions.is_allowed(&call.name) {
@@ -368,11 +458,64 @@ impl Agent for KrabsAgent {
                             continue;
                         }
 
+                        // PreToolUse hook
+                        let pre = self
+                            .hooks
+                            .fire(&HookEvent::PreToolUse {
+                                tool_name: call.name.clone(),
+                                args: call.args.clone(),
+                                tool_use_id: call.id.clone(),
+                            })
+                            .await;
+
+                        match pre {
+                            HookOutput::ToolDecision(ToolUseDecision::Deny { reason }) => {
+                                let msg = format!("Tool call denied by hook: {}", reason);
+                                warn!("{}", msg);
+                                messages.push(Message::tool_result(&msg, &call.id));
+                                continue;
+                            }
+                            HookOutput::ToolDecision(ToolUseDecision::ModifyArgs { args }) => {
+                                debug!("Hook modified args for tool: {}", call.name);
+                                call.args = args;
+                            }
+                            _ => {}
+                        }
+
                         match self.registry.get(&call.name) {
                             Some(tool) => {
                                 debug!("Calling tool: {} with args: {}", call.name, call.args);
-                                let result = tool.call(call.args).await?;
-                                messages.push(Message::tool_result(&result.content, &call.id));
+                                match tool.call(call.args.clone()).await {
+                                    Ok(result) => {
+                                        let post = self
+                                            .hooks
+                                            .fire(&HookEvent::PostToolUse {
+                                                tool_name: call.name.clone(),
+                                                args: call.args.clone(),
+                                                result: result.content.clone(),
+                                                tool_use_id: call.id.clone(),
+                                            })
+                                            .await;
+                                        let content = if let HookOutput::AppendContext(ctx) = post {
+                                            format!("{}\n{}", result.content, ctx)
+                                        } else {
+                                            result.content
+                                        };
+                                        messages.push(Message::tool_result(&content, &call.id));
+                                    }
+                                    Err(e) => {
+                                        self.hooks
+                                            .fire(&HookEvent::PostToolUseFailure {
+                                                tool_name: call.name.clone(),
+                                                args: call.args.clone(),
+                                                error: e.to_string(),
+                                                tool_use_id: call.id.clone(),
+                                            })
+                                            .await;
+                                        messages
+                                            .push(Message::tool_result(e.to_string(), &call.id));
+                                    }
+                                }
                             }
                             None => {
                                 let msg = format!("Tool not found: {}", call.name);
@@ -383,6 +526,8 @@ impl Agent for KrabsAgent {
                     }
                 }
             }
+
+            self.hooks.fire(&HookEvent::TurnEnd { turn }).await;
         }
 
         anyhow::bail!("Max turns ({}) exceeded", self.config.max_turns)
