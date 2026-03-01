@@ -1,6 +1,8 @@
 use crate::config::KrabsConfig;
 use crate::hooks::hook::{HookEvent, HookOutput, ToolUseDecision};
 use crate::hooks::registry::HookRegistry;
+use crate::hooks::langfuse::LangfuseHookBuilder;
+use crate::hooks::telemetry::{TelemetryHook, TelemetryHookBuilder};
 use crate::mcp::mcp::McpRegistry;
 use crate::memory::MemoryStore;
 use crate::permissions::PermissionGuard;
@@ -14,6 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -212,6 +215,48 @@ impl KrabsAgentBuilder {
                 None
             }
         };
+
+        // Auto-register telemetry hook if enabled in config
+        if self.config.telemetry.enabled {
+            let session_id = session.as_ref().map(|s| s.id.clone());
+            let jsonl_path = self
+                .config
+                .telemetry
+                .jsonl_path
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| session_id.as_deref().map(TelemetryHook::default_jsonl_path));
+
+            let mut builder = TelemetryHookBuilder::new().agent_id(&self.agent_id);
+
+            if let Some(sid) = &session_id {
+                builder = builder.session_id(sid);
+            }
+            if let Some(url) = &self.config.telemetry.http_endpoint {
+                builder = builder.http_endpoint(url);
+            }
+            if let Some(path) = jsonl_path {
+                builder = builder.jsonl_path(path);
+            }
+
+            self.hooks.register(Arc::new(builder.build()));
+        }
+
+        // Auto-register Langfuse hook if enabled in config
+        if self.config.langfuse.enabled {
+            let mut builder = LangfuseHookBuilder::new(
+                &self.config.langfuse.public_key,
+                &self.config.langfuse.secret_key,
+            )
+            .base_url(&self.config.langfuse.base_url)
+            .agent_id(&self.agent_id);
+
+            if let Some(s) = session.as_ref() {
+                builder = builder.session_id(&s.id);
+            }
+
+            self.hooks.register(Arc::new(builder.build()));
+        }
 
         Arc::new(KrabsAgent {
             agent_id: self.agent_id,

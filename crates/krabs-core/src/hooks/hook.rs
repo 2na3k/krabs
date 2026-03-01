@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 /// The event payload passed to every hook callback.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HookEvent {
     /// Fired once before the first LLM call.
     AgentStart { task: String },
@@ -48,7 +49,8 @@ impl HookEvent {
 }
 
 /// Decision returned by a `PreToolUse` hook.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolUseDecision {
     Allow,
     Deny {

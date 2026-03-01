@@ -14,10 +14,11 @@ pub mod tools;
 pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
 pub use agents::base_agent::BaseAgent;
 pub use agents::persona::AgentPersona;
-pub use config::config::{CustomModelEntry, KrabsConfig, SkillsConfig};
+pub use config::config::{CustomModelEntry, KrabsConfig, LangfuseConfig, SkillsConfig, TelemetryConfig};
 pub use config::credentials::Credentials;
 pub use hooks::{
-    Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, ToolUseDecision,
+    Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, LangfuseHook,
+    LangfuseHookBuilder, TelemetryHook, TelemetryHookBuilder, ToolUseDecision,
 };
 pub use mcp::mcp::{LiveMcpRegistry, McpRegistry, McpServer};
 pub use mcp::{McpClient, McpReadResourceTool, McpTool};

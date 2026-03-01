@@ -24,6 +24,64 @@ impl Default for SkillsConfig {
     }
 }
 
+/// Langfuse tracing configuration.
+///
+/// Example in `.krabs.json`:
+/// ```json
+/// {
+///   "langfuse": {
+///     "enabled": true,
+///     "public_key": "pk-lf-...",
+///     "secret_key": "sk-lf-...",
+///     "base_url": "http://localhost:3000"
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LangfuseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default)]
+    pub secret_key: String,
+    /// Langfuse base URL. Defaults to `http://localhost:3000`.
+    #[serde(default = "default_langfuse_base_url")]
+    pub base_url: String,
+}
+
+fn default_langfuse_base_url() -> String {
+    "http://localhost:3000".to_string()
+}
+
+/// Telemetry export configuration.
+///
+/// Example in `.krabs.json`:
+/// ```json
+/// {
+///   "telemetry": {
+///     "enabled": true,
+///     "http_endpoint": "http://localhost:9000/events",
+///     "jsonl_path": "/tmp/my-agent.jsonl"
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelemetryConfig {
+    /// Enable telemetry export. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// HTTP endpoint to POST each event to. `None` = disabled.
+    #[serde(default)]
+    pub http_endpoint: Option<String>,
+
+    /// Path to a JSONL file to append events to.
+    /// Defaults to `/tmp/krabs-telemetry-<session_id>.jsonl` when enabled and not set.
+    #[serde(default)]
+    pub jsonl_path: Option<String>,
+}
+
 /// A named custom model entry pointing at an OpenAI-compatible endpoint.
 ///
 /// Example in `~/.krabs/config.json` or `.krabs.json`:
@@ -92,6 +150,12 @@ pub struct KrabsConfig {
     /// Default: 1 (2 total attempts — one try + one retry).
     #[serde(default = "default_tool_max_retries")]
     pub tool_max_retries: usize,
+    /// Telemetry export configuration.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    /// Langfuse tracing configuration.
+    #[serde(default)]
+    pub langfuse: LangfuseConfig,
 }
 
 fn default_model() -> String {
@@ -143,6 +207,8 @@ impl Default for KrabsConfig {
             retry_base_delay_ms: default_retry_base_delay_ms(),
             sandbox: SandboxConfig::default(),
             tool_max_retries: default_tool_max_retries(),
+            telemetry: TelemetryConfig::default(),
+            langfuse: LangfuseConfig::default(),
         }
     }
 }
