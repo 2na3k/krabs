@@ -54,6 +54,98 @@ HookEvent::AgentStop         { result }
 
 ---
 
+### TelemetryHook — Raw Event Export
+
+`crates/krabs-core/src/hooks/telemetry.rs`
+
+Exports every `HookEvent` as a JSON envelope to up to three backends simultaneously (all fire-and-forget):
+
+| Backend | How to enable |
+|---|---|
+| HTTP POST | Set `telemetry.http_endpoint` in config |
+| JSONL file | Set `telemetry.jsonl_path` (auto-defaults to `/tmp/krabs-telemetry-<session_id>.jsonl`) |
+| mpsc channel | Programmatic: `.channel(tx)` on `TelemetryHookBuilder` |
+
+**Envelope shape:**
+```json
+{
+  "event_type": "pre_tool_use",
+  "timestamp_ms": 1740787200123,
+  "session_id": "abc-123",
+  "agent_id": "agent-xyz",
+  "payload": { ... }
+}
+```
+
+**Auto-wired via config** (`config.telemetry.enabled = true`): `build_async` registers it automatically with the session ID and agent ID already set.
+
+**Programmatic use:**
+```rust
+let hook = TelemetryHookBuilder::new()
+    .http_endpoint("http://localhost:9000/events")
+    .jsonl_path("/tmp/my-agent.jsonl")
+    .channel(tx)
+    .build();
+agent_builder.hook(Arc::new(hook));
+```
+
+---
+
+### LangfuseHook — Structured Tracing
+
+`crates/krabs-core/src/hooks/langfuse.rs`
+
+Maps agent lifecycle events to the [Langfuse](https://langfuse.com) batch ingestion API (`POST /api/public/ingestion`), producing a fully nested trace in the Langfuse UI.
+
+**Event mapping:**
+
+| HookEvent | Langfuse type | Effect |
+|---|---|---|
+| `AgentStart` | `trace-create` | Creates root trace with `input=task` |
+| `TurnStart` | `span-create` | Child span of trace |
+| `PreToolUse` | `span-create` | Child of current turn span, `input=args` |
+| `PostToolUse` | `span-update` | Closes tool span with `output=result` |
+| `PostToolUseFailure` | `span-update` | Closes tool span with `level=ERROR` |
+| `TurnEnd` | `span-update` | Closes turn span with `endTime` |
+| `AgentStop` | `trace-create` (upsert) | Adds `output=result` to root trace |
+
+**Resulting trace shape in Langfuse:**
+```
+Trace: "agent-run"  (input=task, output=final result)
+  └─ Span: "turn-0"
+       └─ Span: "bash"       input={args}  output=result
+       └─ Span: "read_file"  input={args}  level=ERROR
+  └─ Span: "turn-1"
+       └─ Span: "web_fetch"  input={args}  output=result
+```
+
+**Auto-wired via config:**
+```json
+{
+  "langfuse": {
+    "enabled": true,
+    "public_key": "pk-lf-...",
+    "secret_key": "sk-lf-...",
+    "base_url": "http://localhost:3000"
+  }
+}
+```
+
+**Programmatic use:**
+```rust
+let hook = LangfuseHookBuilder::new("pk-lf-...", "sk-lf-...")
+    .base_url("http://localhost:3000")
+    .session_id("my-session")
+    .agent_id("my-agent")
+    .build();
+agent_builder.hook(Arc::new(hook));
+```
+
+**Local Langfuse stack:** `docker-compose.yml` at the repo root spins up the full Langfuse v3 stack (Postgres, ClickHouse, MinIO, Redis). Run with `docker compose up -d` then open `http://localhost:3000`.
+
+
+---
+
 ## 2. Durable Execution
 
 ### Storage Backend
@@ -244,7 +336,11 @@ Parsed in `crates/krabs-cli/src/main.rs`; passed as `ResumeMode::Resume { sessio
 | `crates/krabs-core/src/agents/agent.rs` | Agent loop + logging + checkpoint writes + retry helpers |
 | `crates/krabs-core/src/hooks/hook.rs` | Event type definitions |
 | `crates/krabs-core/src/hooks/registry.rs` | Hook dispatch & resolution |
-| `crates/krabs-core/src/config/config.rs` | DB path, retry, and tool retry config |
+| `crates/krabs-core/src/hooks/telemetry.rs` | Raw event export (HTTP / JSONL / channel) |
+| `crates/krabs-core/src/hooks/langfuse.rs` | Langfuse trace/span mapping |
+| `crates/krabs-core/src/config/config.rs` | DB path, retry, telemetry, and langfuse config |
+| `crates/krabs-core/examples/langfuse_trace.rs` | Langfuse smoke-test example |
+| `docker-compose.yml` | Local Langfuse v3 stack |
 | `crates/krabs-core/src/providers/provider.rs` | `StreamChunk::Status` for retry visibility |
 | `crates/krabs-cli/src/main.rs` | `--resume` CLI flag |
 | `crates/krabs-cli/src/chat/agent.rs` | Session ID threading through `DisplayEvent` |

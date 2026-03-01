@@ -30,7 +30,18 @@ Krabs resolves configuration from three sources, applied in order (later overrid
       "api_key": "ollama",
       "model": "llama3.2"
     }
-  ]
+  ],
+  "telemetry": {
+    "enabled": false,
+    "http_endpoint": "http://localhost:9000/events",
+    "jsonl_path": "/tmp/krabs-telemetry.jsonl"
+  },
+  "langfuse": {
+    "enabled": false,
+    "public_key": "pk-lf-...",
+    "secret_key": "sk-lf-...",
+    "base_url": "http://localhost:3000"
+  }
 }
 ```
 
@@ -47,6 +58,13 @@ Krabs resolves configuration from three sources, applied in order (later overrid
 | `skills.paths`       | array of paths   | `["skills/"]`              | Directories to scan for skills                                              |
 | `skills.enabled`     | array of strings | `[]` (all)                 | Allowlist of skill names; empty means all discovered skills are loaded      |
 | `custom_models`      | array            | `[]`                       | Register additional model endpoints (see below)                             |
+| `telemetry.enabled`  | boolean          | `false`                    | Enable raw event export (HTTP, JSONL, or mpsc channel)                      |
+| `telemetry.http_endpoint` | string      | `null`                     | POST each event as JSON to this URL                                         |
+| `telemetry.jsonl_path`    | string      | `/tmp/krabs-telemetry-<session>.jsonl` | Append events as JSONL to this file                       |
+| `langfuse.enabled`   | boolean          | `false`                    | Enable Langfuse tracing                                                     |
+| `langfuse.public_key`| string           | `""`                       | Langfuse project public key (`pk-lf-...`)                                   |
+| `langfuse.secret_key`| string           | `""`                       | Langfuse project secret key (`sk-lf-...`)                                   |
+| `langfuse.base_url`  | string           | `"http://localhost:3000"`  | Langfuse instance URL                                                       |
 
 ### `custom_models` entry
 
