@@ -1,15 +1,21 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use krabs_core::{LlmProvider, Message, StreamChunk, ToolRegistry, UserInputRequest};
 use tokio::sync::{mpsc, oneshot};
 
 use super::app::extract_api_error;
-use super::types::DisplayEvent;
+use super::types::{DisplayEvent, PendingPermission};
+
+// ── Shared permission state (bypasses the DisplayEvent channel entirely) ──────
+
+/// Written by TuiHook, read by the TUI's tick loop.
+pub(super) type SharedPerm = Arc<Mutex<Option<PendingPermission>>>;
 
 // ── TUI hook — bridges KrabsAgent lifecycle events into DisplayEvents ─────────
 
 struct TuiHook {
     tx: mpsc::Sender<DisplayEvent>,
+    perm: SharedPerm,
 }
 
 #[async_trait::async_trait]
@@ -20,7 +26,8 @@ impl krabs_core::Hook for TuiHook {
     ) -> anyhow::Result<krabs_core::HookOutput> {
         use krabs_core::{HookEvent, HookOutput, ToolUseDecision};
         match event {
-            // Before a tool runs: ask the user for permission
+            // Before a tool runs: ask the user for permission via shared mutex,
+            // completely bypassing the DisplayEvent channel to avoid deadlocks.
             HookEvent::PreToolUse {
                 tool_name,
                 args,
@@ -28,21 +35,18 @@ impl krabs_core::Hook for TuiHook {
             } => {
                 let (respond, rx) = oneshot::channel::<bool>();
                 let args_str = serde_json::to_string(args).unwrap_or_default();
-                // If the send fails the channel is closed (turn cancelled) — deny
-                if self
-                    .tx
-                    .send(DisplayEvent::PermissionRequest {
+
+                // Write permission request to shared state (non-blocking, no channel).
+                {
+                    let mut guard = self.perm.lock().unwrap();
+                    *guard = Some(PendingPermission {
                         tool_name: tool_name.clone(),
                         args: args_str,
                         respond,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return Ok(HookOutput::ToolDecision(ToolUseDecision::Deny {
-                        reason: "channel closed".into(),
-                    }));
+                    });
                 }
+
+                // Wait for TUI to respond via the oneshot.
                 let allowed = rx.await.unwrap_or(false);
                 if allowed {
                     Ok(HookOutput::Continue)
@@ -75,6 +79,7 @@ pub(super) async fn build_agent(
     registry: Arc<ToolRegistry>,
     system_prompt: String,
     tx: mpsc::Sender<DisplayEvent>,
+    perm: SharedPerm,
     resume_session_id: Option<String>,
 ) -> Arc<krabs_core::KrabsAgent> {
     use krabs_core::{DelegateTool, DispatchTool, UserInputTool};
@@ -112,7 +117,7 @@ pub(super) async fn build_agent(
     let builder = krabs_core::KrabsAgentBuilder::new(config.clone(), provider)
         .registry(tool_registry)
         .system_prompt(system_prompt)
-        .hook(Arc::new(TuiHook { tx }));
+        .hook(Arc::new(TuiHook { tx, perm }));
     let builder = match resume_session_id {
         Some(sid) => builder.resume_session(sid),
         None => builder,

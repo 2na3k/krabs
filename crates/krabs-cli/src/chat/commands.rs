@@ -12,7 +12,10 @@ use super::types::{ChatMsg, InfoBar};
 // ── constants ────────────────────────────────────────────────────────────────
 
 pub(super) const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/tools", "list available tools"),
+    (
+        "/tools",
+        "list available tools  usage: /tools [allow <name>|deny <name>]",
+    ),
     ("/skills", "list project skills"),
     (
         "/mcp",
@@ -253,7 +256,46 @@ pub(super) fn cmd_models(
 pub(super) fn cmd_tools(app: &mut App, registry: &ToolRegistry) {
     app.push(ChatMsg::Info("available tools:".into()));
     for d in registry.tool_defs() {
-        app.push(ChatMsg::Info(format!("  {:10}  {}", d.name, d.description)));
+        let approved = if app.approved_tools.contains(&d.name) {
+            " [auto-approved]"
+        } else {
+            ""
+        };
+        app.push(ChatMsg::Info(format!(
+            "  {:15}  {}{}",
+            d.name, d.description, approved
+        )));
+    }
+    app.push(ChatMsg::Info(
+        "  /tools allow <name>  pre-approve a tool (no popup)".into(),
+    ));
+    app.push(ChatMsg::Info(
+        "  /tools deny <name>   remove a pre-approval".into(),
+    ));
+}
+
+pub(super) fn cmd_tools_allow(app: &mut App, name: &str) {
+    if name.is_empty() {
+        app.push(ChatMsg::Error("usage: /tools allow <tool-name>".into()));
+        return;
+    }
+    app.approved_tools.insert(name.to_string());
+    app.push(ChatMsg::Info(format!(
+        "  ✓ '{name}' pre-approved — permission popup disabled"
+    )));
+}
+
+pub(super) fn cmd_tools_deny(app: &mut App, name: &str) {
+    if name.is_empty() {
+        app.push(ChatMsg::Error("usage: /tools deny <tool-name>".into()));
+        return;
+    }
+    if app.approved_tools.remove(name) {
+        app.push(ChatMsg::Info(format!(
+            "  ✗ '{name}' approval removed — popup will appear again"
+        )));
+    } else {
+        app.push(ChatMsg::Info(format!("  '{name}' was not pre-approved")));
     }
 }
 

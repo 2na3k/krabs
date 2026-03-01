@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -12,14 +12,15 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use tokio::sync::mpsc;
 
-use super::agent::{build_agent, run_agent_turn};
+use super::agent::{build_agent, run_agent_turn, SharedPerm};
 use super::app::App;
 use super::commands::{
     at_suggestions, build_registry, cmd_agents, cmd_hooks, cmd_mcp, cmd_models, cmd_skills,
-    cmd_tools, cmd_usage, context_limit, load_resume_history, slash_suggestions,
+    cmd_tools, cmd_tools_allow, cmd_tools_deny, cmd_usage, context_limit, load_resume_history,
+    slash_suggestions,
 };
 use super::render::{render, show_splash};
-use super::types::{ChatMsg, DisplayEvent, InfoBar, PendingPermission, PendingUserInput};
+use super::types::{ChatMsg, DisplayEvent, InfoBar, PendingUserInput};
 
 // ── async helper: recv or park ───────────────────────────────────────────────
 
@@ -78,6 +79,10 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
 
     let mut app = App::new();
     app.personas = AgentPersona::discover();
+    // Pre-approve tools listed in config so the permission popup never fires for them.
+    for tool in &krabs_config.auto_approve_tools {
+        app.approved_tools.insert(tool.clone());
+    }
     let mut messages: Vec<Message> = Vec::new();
 
     // If resuming, reconstruct history from the persisted session.
@@ -94,6 +99,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
         }
     }
 
+    let perm: SharedPerm = Arc::new(Mutex::new(None));
     let mut stream_rx: Option<mpsc::Receiver<DisplayEvent>> = None;
     let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -101,6 +107,118 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
         terminal.draw(|f| render(&mut app, max_ctx, &info, f))?;
 
         tokio::select! {
+            biased;
+
+            // ── stream events first so PermissionRequest is never starved ──
+            ev = recv_event(&mut stream_rx) => {
+                match ev {
+                    None => {
+                        if app.spinning {
+                            app.push(ChatMsg::Error("stream closed unexpectedly".into()));
+                        }
+                        app.spinning = false;
+                        stream_rx = None;
+                    }
+                    Some(DisplayEvent::Token(t)) => {
+                        app.spinning = false;
+                        match app.chat.last_mut() {
+                            Some(ChatMsg::Assistant(s)) => s.push_str(&t),
+                            _ => app.chat.push(ChatMsg::Assistant(t)),
+                        }
+                        if app.auto_scroll { app.scroll = u16::MAX; }
+                    }
+                    Some(DisplayEvent::UserInput(req)) => {
+                        app.spinning = false;
+                        let mut options = req.options.clone();
+                        options.push("custom…".into());
+                        let n = options.len();
+                        app.pending_user_input = Some(PendingUserInput {
+                            mode: req.mode,
+                            question: req.question,
+                            options,
+                            selected: vec![false; n],
+                            cursor: 0,
+                            custom_mode: false,
+                            custom_text: String::new(),
+                            custom_cursor: 0,
+                            respond: req.respond,
+                        });
+                    }
+                    Some(DisplayEvent::ToolCallStart(call)) => {
+                        app.spinning = false;
+                        app.push(ChatMsg::ToolCall(format!("{} {}", call.name, call.args)));
+                    }
+                    Some(DisplayEvent::ToolResultEnd(content)) => {
+                        app.push(ChatMsg::ToolResult(content));
+                        app.spinning = true;
+                    }
+                    Some(DisplayEvent::TurnUsage(u)) => {
+                        app.total_input += u.input_tokens;
+                        app.total_output += u.output_tokens;
+                        app.push(ChatMsg::Usage(u.input_tokens, u.output_tokens));
+                    }
+                    Some(DisplayEvent::Done { messages: final_msgs, session_id }) => {
+                        messages = final_msgs;
+                        app.spinning = false;
+                        stream_rx = None;
+                        turn_handle = None;
+                        if session_id.is_some() {
+                            active_resume_id = session_id;
+                        }
+                        if let Some(queued) = app.queued_input.take() {
+                            let mut turn_messages = messages.clone();
+                            turn_messages.push(Message::user(&queued));
+                            messages.push(Message::user(&queued));
+                            app.spinning = true;
+                            let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
+                            stream_rx = Some(rx);
+                            let agent = build_agent(
+                                &krabs_config,
+                                Arc::clone(&provider),
+                                Arc::clone(&registry),
+                                String::new(),
+                                tx.clone(),
+                                Arc::clone(&perm),
+                                active_resume_id.take(),
+                            )
+                            .await;
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
+                        }
+                    }
+                    Some(DisplayEvent::Error { message, session_id }) => {
+                        app.spinning = false;
+                        stream_rx = None;
+                        turn_handle = None;
+                        app.push(ChatMsg::Error(message));
+                        if session_id.is_some() {
+                            active_resume_id = session_id;
+                        }
+                        if let Some(queued) = app.queued_input.take() {
+                            let mut turn_messages = messages.clone();
+                            turn_messages.push(Message::user(&queued));
+                            messages.push(Message::user(&queued));
+                            app.spinning = true;
+                            let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
+                            stream_rx = Some(rx);
+                            let agent = build_agent(
+                                &krabs_config,
+                                Arc::clone(&provider),
+                                Arc::clone(&registry),
+                                String::new(),
+                                tx.clone(),
+                                Arc::clone(&perm),
+                                active_resume_id.take(),
+                            )
+                            .await;
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
+                        }
+                    }
+                    Some(DisplayEvent::Status(text)) => {
+                        app.push(ChatMsg::Info(text));
+                    }
+                }
+            }
+
             // ── keyboard ──
             key = key_rx.recv() => {
                 let Some(ev) = key else { break };
@@ -315,7 +433,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                 if app.pending_permission.is_some() {
                     match key.code {
                         // Allow once
-                        KeyCode::Char('y') | KeyCode::Enter => {
+                        KeyCode::Char('y') => {
                             if let Some(p) = app.pending_permission.take() {
                                 app.push(ChatMsg::Info(format!("  ✓ allowed: {}", p.tool_name)));
                                 let _ = p.respond.send(true);
@@ -532,7 +650,14 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                     }
                                 }
                             }
-                            "/tools"  => cmd_tools(&mut app, &registry),
+                            s if s == "/tools" || s.starts_with("/tools ") => {
+                                let args = s.strip_prefix("/tools").unwrap_or("").trim();
+                                match args.split_once(' ') {
+                                    Some(("allow", name)) => cmd_tools_allow(&mut app, name.trim()),
+                                    Some(("deny", name))  => cmd_tools_deny(&mut app, name.trim()),
+                                    _ => cmd_tools(&mut app, &registry),
+                                }
+                            }
                             "/skills" => cmd_skills(&mut app, &krabs_config.skills),
                             s if s == "/mcp" || s.starts_with("/mcp ") => {
                                 let mcp_args = s.strip_prefix("/mcp").unwrap_or("").trim();
@@ -593,6 +718,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                     Arc::clone(&registry),
                                     String::new(), // system prompt injected by KrabsAgent
                                     tx.clone(),
+                                    Arc::clone(&perm),
                                     active_resume_id.take(),
                                 )
                                 .await;
@@ -610,141 +736,32 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                 }
             }
 
-            // ── stream events ──
-            ev = recv_event(&mut stream_rx) => {
-                match ev {
-                    None => {
-                        if app.spinning {
-                            app.push(ChatMsg::Error("stream closed unexpectedly".into()));
-                        }
-                        app.spinning = false;
-                        stream_rx = None;
-                    }
-                    Some(DisplayEvent::Token(t)) => {
-                        app.spinning = false;
-                        match app.chat.last_mut() {
-                            Some(ChatMsg::Assistant(s)) => s.push_str(&t),
-                            _ => app.chat.push(ChatMsg::Assistant(t)),
-                        }
-                        if app.auto_scroll { app.scroll = u16::MAX; }
-                    }
-                    Some(DisplayEvent::PermissionRequest { tool_name, args, respond }) => {
-                        app.spinning = false;
-                        // Auto-allow tools the user already approved as "always allow"
-                        if app.approved_tools.contains(&tool_name) {
-                            let _ = respond.send(true);
-                        } else {
-                            app.pending_permission = Some(PendingPermission {
-                                tool_name,
-                                args,
-                                respond,
-                            });
-                        }
-                    }
-                    Some(DisplayEvent::UserInput(req)) => {
-                        app.spinning = false;
-                        // Build the options list: user options + "custom…" sentinel
-                        let mut options = req.options.clone();
-                        options.push("custom…".into());
-                        let n = options.len();
-                        app.pending_user_input = Some(PendingUserInput {
-                            mode: req.mode,
-                            question: req.question,
-                            options,
-                            selected: vec![false; n],
-                            cursor: 0,
-                            custom_mode: false,
-                            custom_text: String::new(),
-                            custom_cursor: 0,
-                            respond: req.respond,
-                        });
-                    }
-                    Some(DisplayEvent::ToolCallStart(call)) => {
-                        app.spinning = false;
-                        app.push(ChatMsg::ToolCall(format!("{} {}", call.name, call.args)));
-                    }
-                    Some(DisplayEvent::ToolResultEnd(content)) => {
-                        app.push(ChatMsg::ToolResult(content));
-                        app.spinning = true; // next LLM turn starting
-                    }
-                    Some(DisplayEvent::TurnUsage(u)) => {
-                        app.total_input += u.input_tokens;
-                        app.total_output += u.output_tokens;
-                        app.push(ChatMsg::Usage(u.input_tokens, u.output_tokens));
-                    }
-                    Some(DisplayEvent::Done { messages: final_msgs, session_id }) => {
-                        messages = final_msgs;
-                        app.spinning = false;
-                        stream_rx = None;
-                        turn_handle = None;
-
-                        // Update the resume ID so the next turn continues the same session.
-                        if session_id.is_some() {
-                            active_resume_id = session_id;
-                        }
-
-                        // Flush any message queued while the turn was running.
-                        if let Some(queued) = app.queued_input.take() {
-                            // ChatMsg::User was already pushed at queue time; just dispatch.
-                            let mut turn_messages = messages.clone();
-                            turn_messages.push(Message::user(&queued));
-                            messages.push(Message::user(&queued));
-                            app.spinning = true;
-                            let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
-                            stream_rx = Some(rx);
-                            let agent = build_agent(
-                                &krabs_config,
-                                Arc::clone(&provider),
-                                Arc::clone(&registry),
-                                String::new(),
-                                tx.clone(),
-                                active_resume_id.take(),
-                            )
-                            .await;
-                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
-                        }
-                    }
-                    Some(DisplayEvent::Error { message, session_id }) => {
-                        app.spinning = false;
-                        stream_rx = None;
-                        turn_handle = None;
-                        app.push(ChatMsg::Error(message));
-
-                        if session_id.is_some() {
-                            active_resume_id = session_id;
-                        }
-
-                        // If a message was queued while this turn was running, dispatch it
-                        // now so it isn't silently lost. The queued ChatMsg::User was already
-                        // pushed to the chat at queue time.
-                        if let Some(queued) = app.queued_input.take() {
-                            let mut turn_messages = messages.clone();
-                            turn_messages.push(Message::user(&queued));
-                            messages.push(Message::user(&queued));
-                            app.spinning = true;
-                            let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
-                            stream_rx = Some(rx);
-                            let agent = build_agent(
-                                &krabs_config,
-                                Arc::clone(&provider),
-                                Arc::clone(&registry),
-                                String::new(),
-                                tx.clone(),
-                                active_resume_id.take(),
-                            )
-                            .await;
-                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
-                        }
-                    }
-                    Some(DisplayEvent::Status(text)) => {
-                        app.push(ChatMsg::Info(text));
-                    }
-                }
-            }
-
             // ── spinner tick ──
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 if app.spinning { app.spin_i += 1; }
+
+                // Poll shared permission state (written by TuiHook via mutex)
+                if app.pending_permission.is_none() {
+                    if let Ok(mut guard) = perm.try_lock() {
+                        if let Some(pending) = guard.take() {
+                            app.spinning = false;
+                            if app.approved_tools.contains(&pending.tool_name) {
+                                let _ = pending.respond.send(true);
+                            } else {
+                                let truncated = if pending.args.len() > 60 {
+                                    format!("{}…", &pending.args[..59])
+                                } else {
+                                    pending.args.clone()
+                                };
+                                app.push(ChatMsg::Info(format!(
+                                    "⚠ permission needed: {} {}  →  [y] allow  [a] always  [n] deny",
+                                    pending.tool_name, truncated
+                                )));
+                                app.pending_permission = Some(pending);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

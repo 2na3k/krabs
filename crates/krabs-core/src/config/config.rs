@@ -54,6 +54,81 @@ fn default_langfuse_base_url() -> String {
     "http://localhost:3000".to_string()
 }
 
+/// A single routing rule: regex pattern → target strategy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterRule {
+    /// Case-insensitive regex matched anywhere in the task string.
+    pub pattern: String,
+    /// One of `"reactive"`, `"planned"`, `"explore"`.
+    pub target: String,
+}
+
+/// Task routing configuration.
+///
+/// Controls which execution strategy (`reactive`, `planned`, `explore`) is
+/// chosen for each incoming task. Default `mode = "reactive"` preserves
+/// existing behaviour — no routing overhead.
+///
+/// Example in `.krabs.json`:
+/// ```json
+/// {
+///   "router": {
+///     "mode": "auto",
+///     "classifier": "rules",
+///     "rules": [
+///       { "pattern": "explore|research|discover|survey|map out", "target": "explore" },
+///       { "pattern": "build|implement|create|step.by.step|multi.step", "target": "planned" }
+///     ],
+///     "fallback": "reactive"
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterConfig {
+    /// `"reactive"` — always reactive (default, zero overhead).
+    /// `"planned"`  — always planned.
+    /// `"explore"`  — always explore.
+    /// `"auto"`     — classify each task via `classifier`.
+    #[serde(default = "default_router_mode")]
+    pub mode: String,
+
+    /// `"rules"` — regex rule list (zero LLM cost).
+    /// `"llm"`   — single cheap LLM call before the real run.
+    #[serde(default = "default_classifier")]
+    pub classifier: String,
+
+    /// Evaluated top-to-bottom; first match wins. Used when `classifier = "rules"`.
+    #[serde(default)]
+    pub rules: Vec<RouterRule>,
+
+    /// Strategy when no rule matches (or LLM classifier is ambiguous).
+    #[serde(default = "default_router_fallback")]
+    pub fallback: String,
+}
+
+fn default_router_mode() -> String {
+    "reactive".to_string()
+}
+
+fn default_classifier() -> String {
+    "rules".to_string()
+}
+
+fn default_router_fallback() -> String {
+    "reactive".to_string()
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_router_mode(),
+            classifier: default_classifier(),
+            rules: Vec::new(),
+            fallback: default_router_fallback(),
+        }
+    }
+}
+
 /// Telemetry export configuration.
 ///
 /// Example in `.krabs.json`:
@@ -156,6 +231,13 @@ pub struct KrabsConfig {
     /// Langfuse tracing configuration.
     #[serde(default)]
     pub langfuse: LangfuseConfig,
+    /// Task routing configuration.
+    #[serde(default)]
+    pub router: RouterConfig,
+    /// Tools that are pre-approved and never trigger the permission popup.
+    /// Example: `["bash", "read_file", "web_fetch"]`
+    #[serde(default)]
+    pub auto_approve_tools: Vec<String>,
 }
 
 fn default_model() -> String {
@@ -209,6 +291,8 @@ impl Default for KrabsConfig {
             tool_max_retries: default_tool_max_retries(),
             telemetry: TelemetryConfig::default(),
             langfuse: LangfuseConfig::default(),
+            router: RouterConfig::default(),
+            auto_approve_tools: Vec::new(),
         }
     }
 }

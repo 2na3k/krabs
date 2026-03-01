@@ -118,9 +118,7 @@ struct BatchPayload {
 
 impl BatchPayload {
     fn single(event: Value) -> Self {
-        Self {
-            batch: vec![event],
-        }
+        Self { batch: vec![event] }
     }
 }
 
@@ -151,7 +149,10 @@ pub struct LangfuseHook {
 
 impl LangfuseHook {
     fn ingestion_url(&self) -> String {
-        format!("{}/api/public/ingestion", self.base_url.trim_end_matches('/'))
+        format!(
+            "{}/api/public/ingestion",
+            self.base_url.trim_end_matches('/')
+        )
     }
 
     async fn send(&self, payload: BatchPayload) {
@@ -309,7 +310,9 @@ impl Hook for LangfuseHook {
                 let span_id = new_id();
                 {
                     let mut state = self.state.lock().await;
-                    state.tool_spans.insert(tool_use_id.clone(), span_id.clone());
+                    state
+                        .tool_spans
+                        .insert(tool_use_id.clone(), span_id.clone());
                 }
                 let mut body = json!({
                     "id": span_id,
@@ -355,9 +358,7 @@ impl Hook for LangfuseHook {
             // PostToolUseFailure → span-update (close tool span with ERROR)
             // ------------------------------------------------------------------
             HookEvent::PostToolUseFailure {
-                error,
-                tool_use_id,
-                ..
+                error, tool_use_id, ..
             } => {
                 let state = self.state.lock().await;
                 let span_id = match state.tool_spans.get(tool_use_id) {
@@ -479,7 +480,10 @@ mod tests {
         let hook = LangfuseHookBuilder::new("pk", "sk")
             .base_url("http://localhost:3000/")
             .build();
-        assert_eq!(hook.ingestion_url(), "http://localhost:3000/api/public/ingestion");
+        assert_eq!(
+            hook.ingestion_url(),
+            "http://localhost:3000/api/public/ingestion"
+        );
     }
 
     #[tokio::test]

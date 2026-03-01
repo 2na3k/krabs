@@ -107,12 +107,6 @@ impl ChatMsg {
 
 pub(super) enum DisplayEvent {
     Token(String),
-    /// Sent before a tool runs; background task waits on `respond`.
-    PermissionRequest {
-        tool_name: String,
-        args: String,
-        respond: oneshot::Sender<bool>,
-    },
     /// Sent by `ask_user` tool; TUI renders a choice popup and blocks the agent.
     UserInput(UserInputRequest),
     ToolCallStart(ToolCall),

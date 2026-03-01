@@ -1,12 +1,13 @@
 use crate::config::KrabsConfig;
 use crate::hooks::hook::{HookEvent, HookOutput, ToolUseDecision};
-use crate::hooks::registry::HookRegistry;
 use crate::hooks::langfuse::LangfuseHookBuilder;
+use crate::hooks::registry::HookRegistry;
 use crate::hooks::telemetry::{TelemetryHook, TelemetryHookBuilder};
 use crate::mcp::mcp::McpRegistry;
 use crate::memory::MemoryStore;
 use crate::permissions::PermissionGuard;
 use crate::providers::provider::{LlmProvider, LlmResponse, Message, Role, StreamChunk};
+use crate::router::{RouteDecision, RulesRouter, TaskRouter};
 use crate::sandbox::{SandboxProxy, SandboxedTool};
 use crate::session::session::{Session, SessionStore};
 use crate::skills::registry::SkillRegistry;
@@ -349,6 +350,83 @@ impl KrabsAgent {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Task routing
+    // -----------------------------------------------------------------------
+
+    /// Classify the incoming task and return which execution strategy to use.
+    pub async fn route(&self, task: &str) -> RouteDecision {
+        match self.config.router.mode.as_str() {
+            "planned" => RouteDecision::Planned,
+            "explore" => RouteDecision::Explore,
+            "reactive" => RouteDecision::Reactive,
+            _ => {
+                // "auto" — delegate to configured classifier
+                match self.config.router.classifier.as_str() {
+                    "llm" => self.route_by_llm(task).await,
+                    _ => {
+                        RulesRouter::from_config(&self.config.router)
+                            .route(task)
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
+    /// Classify via a single cheap LLM call (one user message, no tools).
+    async fn route_by_llm(&self, task: &str) -> RouteDecision {
+        let prompt = format!(
+            "Classify the following task into exactly one category:\n\
+             - reactive : simple, single-step, quick answer or action\n\
+             - planned  : complex, multi-step, needs a structured plan\n\
+             - explore  : open-ended research or discovery, no fixed goal\n\n\
+             Task: {task}\n\n\
+             Reply with exactly one word: reactive, planned, or explore."
+        );
+        let msgs = vec![Message::user(&prompt)];
+        match self.provider.complete(&msgs, &[]).await {
+            Ok(crate::providers::provider::LlmResponse::Message { content, .. }) => {
+                let word = content.trim().to_lowercase();
+                if word.contains("planned") {
+                    RouteDecision::Planned
+                } else if word.contains("explore") {
+                    RouteDecision::Explore
+                } else {
+                    RouteDecision::Reactive
+                }
+            }
+            // On any error fall back to rules, then to configured fallback
+            _ => {
+                RulesRouter::from_config(&self.config.router)
+                    .route(task)
+                    .await
+            }
+        }
+    }
+
+    /// Return the system prompt augmented with the strategy-specific prefix.
+    async fn current_system_prompt_for(&self, decision: &RouteDecision) -> String {
+        let base = self.current_system_prompt().await;
+        let prefix = match decision {
+            RouteDecision::Explore => concat!(
+                "You are operating in EXPLORE mode. Your goal is breadth-first discovery.\n",
+                "- Cast a wide net before narrowing down. Favour multiple parallel observations over deep single paths.\n",
+                "- Do not stop at the first answer. Seek alternatives, edge cases, and contradictions.\n",
+                "- Synthesise findings only after thorough exploration.\n\n",
+            ),
+            RouteDecision::Planned => concat!(
+                "You are operating in PLANNED mode. Before taking any action:\n",
+                "1. Decompose the task into clear, ordered subtasks and state the plan explicitly.\n",
+                "2. Execute each subtask fully before moving to the next.\n",
+                "3. After each subtask, check whether the plan needs adjustment.\n",
+                "4. Produce a final synthesised result after all subtasks are complete.\n\n",
+            ),
+            RouteDecision::Reactive => return base,
+        };
+        format!("{prefix}{base}")
+    }
+
     /// Reconstruct the conversation history from the persisted session.
     ///
     /// - If a checkpoint exists, incomplete messages after the checkpoint boundary
@@ -620,6 +698,10 @@ impl KrabsAgent {
     ) -> Result<Vec<Message>> {
         let tool_defs = self.registry.tool_defs();
 
+        // Classify task and pick execution strategy
+        let route = self.route(&task).await;
+        info!(route = route.as_str(), "Task routed");
+
         self.hooks
             .fire(&HookEvent::AgentStart { task: task.clone() })
             .await;
@@ -630,7 +712,7 @@ impl KrabsAgent {
         }
 
         // Ensure a system message is at position 0 (only if non-empty)
-        let system_prompt = self.current_system_prompt().await;
+        let system_prompt = self.current_system_prompt_for(&route).await;
         if !system_prompt.is_empty() {
             if messages
                 .first()
@@ -655,7 +737,7 @@ impl KrabsAgent {
                 return Ok(messages);
             }
 
-            let system_prompt = self.current_system_prompt().await;
+            let system_prompt = self.current_system_prompt_for(&route).await;
             if !system_prompt.is_empty() {
                 if messages
                     .first()
@@ -693,6 +775,11 @@ impl KrabsAgent {
                 async move { self.provider.stream_complete(&msgs, &defs, tx).await }
             })
             .await?;
+            // Drop both sender handles so turn_rx closes after all buffered chunks
+            // are consumed. Without this the while loop below blocks forever because
+            // at least one Sender is still alive.
+            drop(turn_tx);
+            drop(turn_tx_retry);
 
             let mut delta_content = String::new();
             let mut tool_calls_this_turn = Vec::new();
@@ -872,13 +959,17 @@ impl Agent for KrabsAgent {
     async fn run(&self, task: &str) -> Result<AgentOutput> {
         let tool_defs = self.registry.tool_defs();
 
+        // Classify task and pick execution strategy
+        let route = self.route(task).await;
+        info!(route = route.as_str(), "Task routed");
+
         self.hooks
             .fire(&HookEvent::AgentStart {
                 task: task.to_string(),
             })
             .await;
 
-        let system_prompt = self.current_system_prompt().await;
+        let system_prompt = self.current_system_prompt_for(&route).await;
         let user_msg = Message::user(task);
         self.persist_message(&user_msg, 0).await;
         let mut messages = vec![Message::system(&system_prompt), user_msg];
@@ -886,7 +977,7 @@ impl Agent for KrabsAgent {
         let mut tool_calls_made = 0;
 
         for turn in 0..self.config.max_turns {
-            let system_prompt = self.current_system_prompt().await;
+            let system_prompt = self.current_system_prompt_for(&route).await;
             messages[0] = Message::system(&system_prompt);
 
             self.hooks.fire(&HookEvent::TurnStart { turn }).await;

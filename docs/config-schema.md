@@ -65,6 +65,10 @@ Krabs resolves configuration from three sources, applied in order (later overrid
 | `langfuse.public_key`| string           | `""`                       | Langfuse project public key (`pk-lf-...`)                                   |
 | `langfuse.secret_key`| string           | `""`                       | Langfuse project secret key (`sk-lf-...`)                                   |
 | `langfuse.base_url`  | string           | `"http://localhost:3000"`  | Langfuse instance URL                                                       |
+| `router.mode`        | string           | `"reactive"`               | `"reactive"` \| `"planned"` \| `"explore"` \| `"auto"`                     |
+| `router.classifier`  | string           | `"rules"`                  | `"rules"` (regex, free) \| `"llm"` (one LLM call per task)                 |
+| `router.rules`       | array            | `[]`                       | `[{ "pattern": "regex", "target": "explore\|planned\|reactive" }]`         |
+| `router.fallback`    | string           | `"reactive"`               | Strategy when no rule matches                                               |
 
 ### `custom_models` entry
 

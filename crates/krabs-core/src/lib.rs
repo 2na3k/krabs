@@ -6,6 +6,7 @@ pub mod memory;
 pub mod permissions;
 pub mod prompts;
 pub mod providers;
+pub mod router;
 pub mod sandbox;
 pub mod session;
 pub mod skills;
@@ -14,7 +15,10 @@ pub mod tools;
 pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
 pub use agents::base_agent::BaseAgent;
 pub use agents::persona::AgentPersona;
-pub use config::config::{CustomModelEntry, KrabsConfig, LangfuseConfig, SkillsConfig, TelemetryConfig};
+pub use config::config::{
+    CustomModelEntry, KrabsConfig, LangfuseConfig, RouterConfig, RouterRule, SkillsConfig,
+    TelemetryConfig,
+};
 pub use config::credentials::Credentials;
 pub use hooks::{
     Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, LangfuseHook,
@@ -26,6 +30,7 @@ pub use permissions::PermissionGuard;
 pub use providers::provider::{
     LlmProvider, LlmResponse, Message, Role, StreamChunk, TokenUsage, ToolCall,
 };
+pub use router::{parse_decision, FixedRouter, RouteDecision, RulesRouter, TaskRouter};
 pub use sandbox::{SandboxConfig, SandboxProxy, SandboxedTool};
 
 pub use providers::{AnthropicProvider, GeminiProvider, OpenAiProvider};
