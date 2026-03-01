@@ -7,6 +7,7 @@ pub mod read_skill;
 pub mod registry;
 pub mod tool;
 pub mod user_input;
+pub mod web_fetch;
 pub mod write;
 
 pub use delegate::DelegateTool;

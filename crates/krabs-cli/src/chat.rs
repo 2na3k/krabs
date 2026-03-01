@@ -8,7 +8,7 @@ use krabs_core::{
     skills::loader::SkillLoader, AgentPersona, BaseAgent, BashTool, Credentials, CustomModelEntry,
     DelegateTool, DispatchTool, GlobTool, GrepTool, HookConfig, HookEntry, KrabsConfig,
     LlmProvider, McpRegistry, McpServer, Message, ReadTool, Role, SkillsConfig, StreamChunk,
-    TokenUsage, ToolCall, ToolRegistry, WriteTool,
+    TokenUsage, ToolCall, ToolRegistry, WebFetchTool, WriteTool,
 };
 use krabs_core::{InputMode, UserInputRequest, UserInputTool};
 use ratatui::{
@@ -150,6 +150,7 @@ fn build_registry() -> ToolRegistry {
     r.register(Arc::new(GlobTool));
     r.register(Arc::new(GrepTool));
     r.register(Arc::new(ReadTool));
+    r.register(Arc::new(WebFetchTool::new()));
     r.register(Arc::new(WriteTool));
     r
 }

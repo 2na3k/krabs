@@ -36,5 +36,6 @@ pub use tools::read::ReadTool;
 pub use tools::registry::ToolRegistry;
 pub use tools::tool::{Tool, ToolDef, ToolResult};
 pub use tools::user_input::{InputMode, UserInputRequest, UserInputTool};
+pub use tools::web_fetch::WebFetchTool;
 pub use tools::write::WriteTool;
 pub use tools::ReadSkillTool;
