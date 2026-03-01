@@ -204,15 +204,11 @@ impl Session {
     /// System messages are **skipped** — they are ephemeral and rebuilt every
     /// turn from the current config/skills state.
     pub async fn persist_message(&self, message: &Message, turn: usize) -> Result<()> {
-        if matches!(message.role, Role::System) {
-            return Ok(());
-        }
-
         let role = match message.role {
+            Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",
-            Role::System => unreachable!(),
         };
 
         let tool_args = match &message.tool_calls {
@@ -373,6 +369,7 @@ impl Session {
     /// System messages are never stored, so `role == "system"` is an error.
     pub fn stored_to_message(stored: &StoredMessage) -> Result<Message> {
         match stored.role.as_str() {
+            "system" => Ok(Message::system(&stored.content)),
             "user" => Ok(Message::user(&stored.content)),
             "assistant" => {
                 if stored.tool_args.is_some() {
@@ -613,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_messages_are_not_persisted() {
+    async fn system_messages_are_persisted() {
         let (store, path) = open_temp_store().await;
         let session = store
             .new_session("agent-1", "gpt-4o", "openai")
@@ -630,8 +627,13 @@ mod tests {
             .unwrap();
 
         let messages = session.messages().await.unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, "You are helpful.");
+        assert_eq!(messages[1].role, "user");
+
+        let reconstructed = Session::stored_to_message(&messages[0]).unwrap();
+        assert!(matches!(reconstructed.role, Role::System));
 
         drop(store);
         let _ = std::fs::remove_file(path);

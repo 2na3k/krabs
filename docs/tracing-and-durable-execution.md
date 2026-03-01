@@ -19,6 +19,7 @@
 ### Design Principle
 - Persistence failures (`warn!`) are **non-blocking** — the agent loop continues even if DB writes fail.
 - Tool/permission issues are warnings, not fatal errors.
+- Retry warnings are also forwarded to the CLI as `StreamChunk::Status` messages (rendered as dimmed italic lines), so users see retries in real time without needing a log subscriber.
 
 **Key file:** `crates/krabs-core/src/agents/agent.rs`
 
@@ -47,6 +48,10 @@ HookEvent::AgentStop         { result }
   - Other events: `Stop > SystemMessage > AppendContext > Continue`
 - Hook errors are logged and skipped (never fatal)
 
+> `PostToolUseFailure` fires when the final `ToolResult` has `is_error: true` (both hard errors
+> normalised by `call_tool_with_retry` and soft tool errors after retries are exhausted).
+> `PostToolUse` fires only on success. Hooks no longer need to inspect `result.is_error`.
+
 ---
 
 ## 2. Durable Execution
@@ -54,7 +59,8 @@ HookEvent::AgentStop         { result }
 ### Storage Backend
 - **SQLite** via `sqlx` v0.8 (`sqlite`, `runtime-tokio`, `migrate`, `macros` features)
 - DB path configurable; resolved at `SessionStore::open(db_path)`
-- Schema applied via sqlx migrations on open
+- Schema applied inline via `sqlx::query(MIGRATE)` on open (not via sqlx migration files)
+- Best-effort `ALTER TABLE errors ADD COLUMN attempt` runs on open to upgrade pre-existing DBs that lack the column; errors are silently swallowed
 
 **Key file:** `crates/krabs-core/src/session/session.rs`
 
@@ -69,13 +75,14 @@ sessions
   model       TEXT
   provider    TEXT
   created_at  INTEGER       -- Unix seconds
+  metadata    TEXT          -- reserved, currently unused
 
 messages
   id          INTEGER PK AUTOINCREMENT  -- used as checkpoint boundary
   session_id  TEXT FK
   agent_id    TEXT
   turn        INTEGER
-  role        TEXT          -- "user" | "assistant" | "tool"  (system never persisted)
+  role        TEXT          -- "system" | "user" | "assistant" | "tool"
   content     TEXT
   tool_call_id TEXT
   tool_name   TEXT
@@ -89,7 +96,7 @@ token_usage
 
 errors
   id, session_id, agent_id, turn
-  context     TEXT          -- e.g. "llm_stream", "max_turns"
+  context     TEXT          -- e.g. "llm_stream", "llm_complete", "bash", "max_turns"
   message     TEXT
   attempt     INTEGER       -- 0-indexed retry count
   created_at  INTEGER
@@ -113,6 +120,10 @@ checkpoints
 | `StoredError`      | Error + retry attempt for diagnostics                    |
 | `StoredTokenUsage` | Per-turn token accounting                                |
 
+**Additional `Session` query helpers** (not used by the agent loop directly):
+- `session.search(query)` — LIKE search over message content
+- `session.total_token_usage()` — aggregate `SUM(input_tokens), SUM(output_tokens)`
+
 ---
 
 ### Checkpoint & Resume Flow
@@ -120,7 +131,7 @@ checkpoints
 **Writing a checkpoint** (after each successful turn):
 ```
 write_checkpoint(turn)
-  → SELECT MAX(id) FROM messages WHERE session_id = ?
+  → SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?
   → INSERT INTO checkpoints (turn, last_msg_id, ...)
 ```
 
@@ -143,23 +154,60 @@ write_checkpoint(turn)
 ### Persistence During the Agent Loop
 
 ```
-Each LLM message received     → persist_message(msg, turn)
-Each LLM call completes       → persist_token_usage(turn, in, out)
-Each retry failure            → persist_error(turn, context, error, attempt)
-After each successful turn    → write_checkpoint(turn)
+Newest user message submitted  → persist_message(msg, turn=0)   [streaming path only]
+Each LLM message received      → persist_message(msg, turn)
+Each LLM call completes        → persist_token_usage(turn, in, out)
+Each retry failure             → persist_error(turn, context, error, attempt)
+After each successful turn     → write_checkpoint(turn)
 ```
 
-System messages are **never persisted** — they're rebuilt dynamically each turn, keeping the DB lean and allowing prompts to evolve.
+> **Streaming path detail:** `streaming_loop_inner` persists the **last** (newest) user
+> message in the history at startup — not the first. This correctly handles resumed sessions
+> where earlier user messages are already in the DB.
+
+System messages **are persisted** alongside other roles. On resume, the full conversation including system messages is reloaded from the DB.
 
 ---
 
-### Retry with Persistence
+### LLM Retry with Persistence
 
-`call_with_retry(turn, context, closure)`:
-- Exponential backoff: base 500ms, multiplier `2^attempt`
-- Each failure calls `persist_error(...)` with the attempt index
-- Max retries: configurable (default 3)
-- Failures are `warn!`, not `error!` — agent decides whether to abort
+`call_with_retry(turn, context, status_tx, closure)`:
+- Exponential backoff: `base_ms * 2^attempt` (base 500ms default)
+- Each failure calls `persist_error(turn, context, error, attempt)` with the 0-indexed attempt
+- Max retries: `config.max_retries` (default 3, so 4 total attempts)
+- Each retry emits a `StreamChunk::Status` via `status_tx` (streaming path) so the CLI shows retry progress
+- Failures are `warn!`, not `error!` — after exhausting retries the `Err` propagates and the agent loop decides whether to abort
+
+---
+
+### Tool Retry with Persistence
+
+`call_tool_with_retry(turn, tool_name, tool, args, status_tx)`:
+- Handles **both** hard errors (`Err(e)`) and soft errors (`ToolResult { is_error: true }`)
+- Exponential backoff reuses `config.retry_base_delay_ms`
+- Max retries: `config.tool_max_retries` (default 1, so 2 total attempts)
+- Hard errors are persisted via `persist_error`; soft errors are not (they're a tool-level concern)
+- Each retry emits a `StreamChunk::Status` to the CLI
+- After exhausting retries, returns the final `ToolResult` to the LLM; `PostToolUse` fires for all outcomes
+
+---
+
+### CLI Session Continuity
+
+The CLI maintains session continuity across turns and queued messages:
+
+```
+Turn completes (Done)  → DisplayEvent::Done { messages, session_id }
+                         active_resume_id = session_id
+Turn fails (Error)     → DisplayEvent::Error { message, session_id }
+                         active_resume_id = session_id
+
+Queued message dispatched → build_agent(..., active_resume_id.take())
+                            → ResumeMode::Resume { session_id }
+                            → same session continues in DB
+```
+
+This ensures that a message typed while the agent is thinking, and dispatched after the current turn completes (or errors), is recorded in the same session rather than creating a new one.
 
 ---
 
@@ -178,10 +226,12 @@ Parsed in `crates/krabs-cli/src/main.rs`; passed as `ResumeMode::Resume { sessio
 | Decision | Rationale |
 |---|---|
 | Checkpoint by `last_msg_id` | Atomic, cheap reference; no distributed txn needed |
-| System messages not persisted | Rebuilt each turn; allows dynamic prompts, reduces DB size |
+| All roles persisted (incl. system) | Full conversation state in DB enables exact replay on resume |
 | Persistence failures non-fatal | Agent liveness > perfect observability |
 | Hook-based event bus | Decouples observability from business logic |
 | Attempt tracking in errors | Enables cost/failure analysis per retry |
+| `status_tx` in retry helpers | Retry visibility in CLI without requiring a log subscriber |
+| `PostToolUseFailure` on error, `PostToolUse` on success | Clean hook surface; hooks don't need to inspect `is_error` |
 | `Result<T>` everywhere, no `unwrap` | Correctness by construction (CLAUDE.md law) |
 
 ---
@@ -190,9 +240,11 @@ Parsed in `crates/krabs-cli/src/main.rs`; passed as `ResumeMode::Resume { sessio
 
 | File | Role |
 |---|---|
-| `crates/krabs-core/src/session/session.rs` | All persistence logic (~795 lines) |
-| `crates/krabs-core/src/agents/agent.rs` | Agent loop + logging + checkpoint writes |
+| `crates/krabs-core/src/session/session.rs` | All persistence logic (~800 lines) |
+| `crates/krabs-core/src/agents/agent.rs` | Agent loop + logging + checkpoint writes + retry helpers |
 | `crates/krabs-core/src/hooks/hook.rs` | Event type definitions |
 | `crates/krabs-core/src/hooks/registry.rs` | Hook dispatch & resolution |
-| `crates/krabs-core/src/config/config.rs` | DB path config |
+| `crates/krabs-core/src/config/config.rs` | DB path, retry, and tool retry config |
+| `crates/krabs-core/src/providers/provider.rs` | `StreamChunk::Status` for retry visibility |
 | `crates/krabs-cli/src/main.rs` | `--resume` CLI flag |
+| `crates/krabs-cli/src/chat/agent.rs` | Session ID threading through `DisplayEvent` |

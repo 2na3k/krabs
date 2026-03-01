@@ -664,8 +664,10 @@ impl KrabsAgent {
                     }
                     StreamChunk::Status { .. } => {}
                 }
-                if matches!(chunk, StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. })
-                    && tx.send(chunk).await.is_err()
+                if matches!(
+                    chunk,
+                    StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. }
+                ) && tx.send(chunk).await.is_err()
                 {
                     // Consumer dropped (Ctrl+C) — stop the loop.
                     return Ok(messages);
@@ -740,15 +742,25 @@ impl KrabsAgent {
                                     Some(&tx),
                                 )
                                 .await;
-                            let post = self
-                                .hooks
-                                .fire(&HookEvent::PostToolUse {
-                                    tool_name: call.name.clone(),
-                                    args: call.args.clone(),
-                                    result: result.content.clone(),
-                                    tool_use_id: call.id.clone(),
-                                })
-                                .await;
+                            let post = if result.is_error {
+                                self.hooks
+                                    .fire(&HookEvent::PostToolUseFailure {
+                                        tool_name: call.name.clone(),
+                                        args: call.args.clone(),
+                                        error: result.content.clone(),
+                                        tool_use_id: call.id.clone(),
+                                    })
+                                    .await
+                            } else {
+                                self.hooks
+                                    .fire(&HookEvent::PostToolUse {
+                                        tool_name: call.name.clone(),
+                                        args: call.args.clone(),
+                                        result: result.content.clone(),
+                                        tool_use_id: call.id.clone(),
+                                    })
+                                    .await
+                            };
                             let content = if let HookOutput::AppendContext(ctx) = post {
                                 format!("{}\n{}", result.content, ctx)
                             } else {
@@ -945,15 +957,25 @@ impl Agent for KrabsAgent {
                                         None,
                                     )
                                     .await;
-                                let post = self
-                                    .hooks
-                                    .fire(&HookEvent::PostToolUse {
-                                        tool_name: call.name.clone(),
-                                        args: call.args.clone(),
-                                        result: result.content.clone(),
-                                        tool_use_id: call.id.clone(),
-                                    })
-                                    .await;
+                                let post = if result.is_error {
+                                    self.hooks
+                                        .fire(&HookEvent::PostToolUseFailure {
+                                            tool_name: call.name.clone(),
+                                            args: call.args.clone(),
+                                            error: result.content.clone(),
+                                            tool_use_id: call.id.clone(),
+                                        })
+                                        .await
+                                } else {
+                                    self.hooks
+                                        .fire(&HookEvent::PostToolUse {
+                                            tool_name: call.name.clone(),
+                                            args: call.args.clone(),
+                                            result: result.content.clone(),
+                                            tool_use_id: call.id.clone(),
+                                        })
+                                        .await
+                                };
                                 let content = if let HookOutput::AppendContext(ctx) = post {
                                     format!("{}\n{}", result.content, ctx)
                                 } else {

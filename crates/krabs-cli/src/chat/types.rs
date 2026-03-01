@@ -118,8 +118,14 @@ pub(super) enum DisplayEvent {
     ToolCallStart(ToolCall),
     ToolResultEnd(String),
     TurnUsage(TokenUsage),
-    Done { messages: Vec<Message>, session_id: Option<String> },
-    Error { message: String, session_id: Option<String> },
+    Done {
+        messages: Vec<Message>,
+        session_id: Option<String>,
+    },
+    Error {
+        message: String,
+        session_id: Option<String>,
+    },
     Status(String),
 }
 

@@ -181,5 +181,10 @@ pub(super) async fn run_agent_turn(
             return;
         }
     };
-    let _ = tx.send(DisplayEvent::Done { messages: final_messages, session_id }).await;
+    let _ = tx
+        .send(DisplayEvent::Done {
+            messages: final_messages,
+            session_id,
+        })
+        .await;
 }
