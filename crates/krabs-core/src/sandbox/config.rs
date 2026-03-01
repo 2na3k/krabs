@@ -40,10 +40,7 @@ impl SandboxConfig {
                 .canonicalize()
                 .unwrap_or_else(|_| denied.to_path_buf());
             if canonical.starts_with(&denied_canonical) {
-                return Err(format!(
-                    "sandbox: read denied for path {}",
-                    path.display()
-                ));
+                return Err(format!("sandbox: read denied for path {}", path.display()));
             }
         }
         Ok(())
@@ -90,10 +87,7 @@ impl SandboxConfig {
                 return Ok(());
             }
         }
-        Err(format!(
-            "sandbox: write denied for path {}",
-            path.display()
-        ))
+        Err(format!("sandbox: write denied for path {}", path.display()))
     }
 
     /// Check if a domain is allowed for network access.
@@ -114,14 +108,12 @@ impl SandboxConfig {
 
         // If allowlist is non-empty, host must match
         if !self.allowed_domains.is_empty() {
-            let allowed = self.allowed_domains.iter().any(|a| {
-                host == a.as_str() || host.ends_with(&format!(".{}", a))
-            });
+            let allowed = self
+                .allowed_domains
+                .iter()
+                .any(|a| host == a.as_str() || host.ends_with(&format!(".{}", a)));
             if !allowed {
-                return Err(format!(
-                    "sandbox: domain {} not in allowlist",
-                    host
-                ));
+                return Err(format!("sandbox: domain {} not in allowlist", host));
             }
         }
 
@@ -180,7 +172,9 @@ mod tests {
             denied_read_paths: vec![tmp.path().join("secrets")],
             ..Default::default()
         };
-        assert!(cfg.check_read_path(Path::new("/tmp/some_other_file")).is_ok());
+        assert!(cfg
+            .check_read_path(Path::new("/tmp/some_other_file"))
+            .is_ok());
     }
 
     // ── path / write guards ─────────────────────────────────────────────────

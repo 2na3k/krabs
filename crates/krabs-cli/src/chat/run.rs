@@ -123,9 +123,11 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                     continue 'main;
                 }
 
+                let busy = app.spinning || stream_rx.is_some();
+
                 // Scroll (always available)
                 match key.code {
-                    KeyCode::Up if !app.spinning && stream_rx.is_none() => {
+                    KeyCode::Up if !busy => {
                         let slash_sugg = slash_suggestions(&app.input);
                         let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
                             at_suggestions(&app.input[1..], &app.personas)
@@ -150,7 +152,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         }
                         continue 'main;
                     }
-                    KeyCode::Down if !app.spinning && stream_rx.is_none() => {
+                    KeyCode::Down if !busy => {
                         let slash_sugg = slash_suggestions(&app.input);
                         let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
                             at_suggestions(&app.input[1..], &app.personas)
@@ -345,11 +347,6 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                     continue 'main;
                 }
 
-                // Ignore editing while busy
-                if app.spinning || stream_rx.is_some() {
-                    continue 'main;
-                }
-
                 match key.code {
                     // Tab: autocomplete selected suggestion
                     KeyCode::Tab => {
@@ -441,6 +438,13 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         app.cursor = 0;
                         app.auto_scroll = true;
                         app.scroll = u16::MAX;
+
+                        // Queue message if a turn is running; it will be dispatched on Done.
+                        if busy {
+                            app.push(ChatMsg::User(input.clone()));
+                            app.queued_input = Some(input);
+                            continue 'main;
+                        }
 
                         // @<name> alone — activate persona
                         if input.starts_with('@') && !input.contains(' ') {
@@ -668,17 +672,72 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         app.total_output += u.output_tokens;
                         app.push(ChatMsg::Usage(u.input_tokens, u.output_tokens));
                     }
-                    Some(DisplayEvent::Done(final_msgs)) => {
+                    Some(DisplayEvent::Done { messages: final_msgs, session_id }) => {
                         messages = final_msgs;
                         app.spinning = false;
                         stream_rx = None;
                         turn_handle = None;
+
+                        // Update the resume ID so the next turn continues the same session.
+                        if session_id.is_some() {
+                            active_resume_id = session_id;
+                        }
+
+                        // Flush any message queued while the turn was running.
+                        if let Some(queued) = app.queued_input.take() {
+                            // ChatMsg::User was already pushed at queue time; just dispatch.
+                            let mut turn_messages = messages.clone();
+                            turn_messages.push(Message::user(&queued));
+                            messages.push(Message::user(&queued));
+                            app.spinning = true;
+                            let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
+                            stream_rx = Some(rx);
+                            let agent = build_agent(
+                                &krabs_config,
+                                Arc::clone(&provider),
+                                Arc::clone(&registry),
+                                String::new(),
+                                tx.clone(),
+                                active_resume_id.take(),
+                            )
+                            .await;
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
+                        }
                     }
-                    Some(DisplayEvent::Error(msg)) => {
+                    Some(DisplayEvent::Error { message, session_id }) => {
                         app.spinning = false;
                         stream_rx = None;
                         turn_handle = None;
-                        app.push(ChatMsg::Error(msg));
+                        app.push(ChatMsg::Error(message));
+
+                        if session_id.is_some() {
+                            active_resume_id = session_id;
+                        }
+
+                        // If a message was queued while this turn was running, dispatch it
+                        // now so it isn't silently lost. The queued ChatMsg::User was already
+                        // pushed to the chat at queue time.
+                        if let Some(queued) = app.queued_input.take() {
+                            let mut turn_messages = messages.clone();
+                            turn_messages.push(Message::user(&queued));
+                            messages.push(Message::user(&queued));
+                            app.spinning = true;
+                            let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
+                            stream_rx = Some(rx);
+                            let agent = build_agent(
+                                &krabs_config,
+                                Arc::clone(&provider),
+                                Arc::clone(&registry),
+                                String::new(),
+                                tx.clone(),
+                                active_resume_id.take(),
+                            )
+                            .await;
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
+                        }
+                    }
+                    Some(DisplayEvent::Status(text)) => {
+                        app.push(ChatMsg::Info(text));
                     }
                 }
             }

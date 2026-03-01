@@ -93,6 +93,7 @@ impl LlmProvider for AnthropicProvider {
                 StreamChunk::Delta { text } => content.push_str(&text),
                 StreamChunk::ToolCallReady { call } => tool_calls.push(call),
                 StreamChunk::Done { usage: u } => usage = u,
+                StreamChunk::Status { .. } => {}
             }
         }
 

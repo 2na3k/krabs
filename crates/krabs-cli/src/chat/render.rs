@@ -1,3 +1,6 @@
+use anyhow::Result;
+use crossterm::event::{Event, KeyEventKind};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -5,12 +8,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use crossterm::event::{Event, KeyEventKind};
-use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io;
-use anyhow::Result;
 
 use super::app::App;
 use super::commands::{at_suggestions, slash_suggestions};

@@ -87,7 +87,10 @@ async fn fetch_with_client(client: &Client, args: serde_json::Value) -> Result<T
         req = req.body(body.to_string());
     }
 
-    let response = req.send().await.map_err(|e| anyhow::anyhow!("Request failed: {e}"))?;
+    let response = req
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Request failed: {e}"))?;
 
     let status = response.status();
     let is_error = status.is_client_error() || status.is_server_error();
@@ -105,15 +108,15 @@ async fn fetch_with_client(client: &Client, args: serde_json::Value) -> Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use std::convert::Infallible;
-    use std::net::SocketAddr;
     use http_body_util::Full;
     use hyper::body::Bytes;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
+    use serde_json::json;
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
     async fn serve_once<F, Fut>(handler: F) -> SocketAddr

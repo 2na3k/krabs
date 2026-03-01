@@ -125,11 +125,15 @@ pub(super) async fn run_agent_turn(
     messages: Vec<Message>,
     tx: mpsc::Sender<DisplayEvent>,
 ) {
+    let session_id = agent.session_id().map(|s| s.to_string());
     let (mut stream, done_rx) = match agent.run_streaming_with_history(messages).await {
         Ok(r) => r,
         Err(e) => {
             let _ = tx
-                .send(DisplayEvent::Error(extract_api_error(&e.to_string())))
+                .send(DisplayEvent::Error {
+                    message: extract_api_error(&e.to_string()),
+                    session_id,
+                })
                 .await;
             return;
         }
@@ -152,15 +156,23 @@ pub(super) async fn run_agent_turn(
                     return;
                 }
             }
+            StreamChunk::Status { text } => {
+                if tx.send(DisplayEvent::Status(text)).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 
     // Stream closed — get final message history from done channel
-    let final_messages = match done_rx.await {
-        Ok(Ok(msgs)) => msgs,
+    let (session_id, final_messages) = match done_rx.await {
+        Ok(Ok((sid, msgs))) => (sid, msgs),
         Ok(Err(e)) => {
             let _ = tx
-                .send(DisplayEvent::Error(extract_api_error(&e.to_string())))
+                .send(DisplayEvent::Error {
+                    message: extract_api_error(&e.to_string()),
+                    session_id,
+                })
                 .await;
             return;
         }
@@ -169,5 +181,5 @@ pub(super) async fn run_agent_turn(
             return;
         }
     };
-    let _ = tx.send(DisplayEvent::Done(final_messages)).await;
+    let _ = tx.send(DisplayEvent::Done { messages: final_messages, session_id }).await;
 }

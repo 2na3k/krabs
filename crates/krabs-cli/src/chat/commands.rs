@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use krabs_core::{
-    skills::loader::SkillLoader, AgentPersona, BaseAgent, BashTool, CustomModelEntry, Credentials,
+    skills::loader::SkillLoader, AgentPersona, BaseAgent, BashTool, Credentials, CustomModelEntry,
     GlobTool, GrepTool, HookConfig, HookEntry, KrabsConfig, LlmProvider, McpRegistry, McpServer,
     Message, ReadTool, SkillsConfig, ToolRegistry, WebFetchTool, WriteTool,
 };
@@ -89,7 +89,10 @@ pub(super) fn slash_suggestions(prefix: &str) -> Vec<(&'static str, &'static str
 }
 
 /// Return persona names whose names start with `prefix` (after stripping `@`).
-pub(super) fn at_suggestions<'a>(prefix: &str, personas: &'a [AgentPersona]) -> Vec<(&'a str, &'a str)> {
+pub(super) fn at_suggestions<'a>(
+    prefix: &str,
+    personas: &'a [AgentPersona],
+) -> Vec<(&'a str, &'a str)> {
     personas
         .iter()
         .filter(|p| p.name.starts_with(prefix))
@@ -581,17 +584,14 @@ pub(super) async fn load_resume_history(
     let mut display: Vec<ChatMsg> = Vec::new();
 
     for s in &stored {
-        match KrabsSession::stored_to_message(s) {
-            Ok(msg) => {
-                let dm = match s.role.as_str() {
-                    "user" => ChatMsg::User(s.content.clone()),
-                    "assistant" if s.tool_args.is_none() => ChatMsg::Assistant(s.content.clone()),
-                    _ => ChatMsg::Info(format!("[{}] {}", s.role, s.content)),
-                };
-                display.push(dm);
-                messages.push(msg);
-            }
-            Err(_) => {}
+        if let Ok(msg) = KrabsSession::stored_to_message(s) {
+            let dm = match s.role.as_str() {
+                "user" => ChatMsg::User(s.content.clone()),
+                "assistant" if s.tool_args.is_none() => ChatMsg::Assistant(s.content.clone()),
+                _ => ChatMsg::Info(format!("[{}] {}", s.role, s.content)),
+            };
+            display.push(dm);
+            messages.push(msg);
         }
     }
 
@@ -608,4 +608,3 @@ pub(super) fn build_registry() -> ToolRegistry {
     r.register(Arc::new(WriteTool));
     r
 }
-

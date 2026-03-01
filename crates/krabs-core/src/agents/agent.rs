@@ -333,7 +333,13 @@ impl KrabsAgent {
     /// Retry an async operation with exponential backoff, persisting each
     /// failure. Returns `Ok` on the first success, or `Err` after exhausting
     /// all attempts.
-    async fn call_with_retry<F, Fut, T>(&self, turn: usize, context: &str, mut f: F) -> Result<T>
+    async fn call_with_retry<F, Fut, T>(
+        &self,
+        turn: usize,
+        context: &str,
+        status_tx: Option<&mpsc::Sender<StreamChunk>>,
+        mut f: F,
+    ) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -348,15 +354,78 @@ impl KrabsAgent {
                     self.persist_error(turn, context, &e, attempt).await;
                     if attempt < max {
                         let delay = base_ms * 2u64.pow(attempt as u32);
-                        warn!(
-                            "Attempt {}/{} failed for '{}': {e}. Retrying in {delay}ms…",
+                        let msg = format!(
+                            "↻ LLM attempt {}/{} failed: {e} — retrying in {delay}ms…",
                             attempt + 1,
                             max + 1,
-                            context
                         );
+                        warn!("{msg}");
+                        if let Some(tx) = status_tx {
+                            let _ = tx.send(StreamChunk::Status { text: msg }).await;
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
                     } else {
                         return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    /// Call a tool with exponential-backoff retry on both hard errors (Err)
+    /// and soft errors (ToolResult { is_error: true }).
+    /// After exhausting retries, returns the final ToolResult for the LLM to handle.
+    /// If `status_tx` is provided, a `StreamChunk::Status` is emitted on each retry.
+    async fn call_tool_with_retry(
+        &self,
+        turn: usize,
+        tool_name: &str,
+        tool: Arc<dyn crate::tools::tool::Tool>,
+        args: serde_json::Value,
+        status_tx: Option<&mpsc::Sender<StreamChunk>>,
+    ) -> crate::tools::tool::ToolResult {
+        let max = self.config.tool_max_retries;
+        let base_ms = self.config.retry_base_delay_ms;
+
+        for attempt in 0..=max {
+            match tool.call(args.clone()).await {
+                Ok(result) if !result.is_error => return result,
+                Ok(result) => {
+                    if attempt < max {
+                        let delay = base_ms * 2u64.pow(attempt as u32);
+                        let msg = format!(
+                            "↻ tool '{}' attempt {}/{} failed — retrying in {delay}ms…",
+                            tool_name,
+                            attempt + 1,
+                            max + 1,
+                        );
+                        warn!("{msg}");
+                        if let Some(tx) = status_tx {
+                            let _ = tx.send(StreamChunk::Status { text: msg }).await;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                    } else {
+                        return result;
+                    }
+                }
+                Err(e) => {
+                    self.persist_error(turn, tool_name, &e, attempt).await;
+                    if attempt < max {
+                        let delay = base_ms * 2u64.pow(attempt as u32);
+                        let msg = format!(
+                            "↻ tool '{}' attempt {}/{} error: {e} — retrying in {delay}ms…",
+                            tool_name,
+                            attempt + 1,
+                            max + 1,
+                        );
+                        warn!("{msg}");
+                        if let Some(tx) = status_tx {
+                            let _ = tx.send(StreamChunk::Status { text: msg }).await;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                    } else {
+                        return crate::tools::tool::ToolResult::err(e.to_string());
                     }
                 }
             }
@@ -451,16 +520,22 @@ impl KrabsAgent {
     /// Returns a stream of `StreamChunk`s and a oneshot that fires with the
     /// final message list (including all new assistant + tool messages) when
     /// the agent loop completes, or `Err` if the loop fails.
+    /// The session ID for this agent, if persistence is active.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.id.as_str())
+    }
+
     pub async fn run_streaming_with_history(
         self: Arc<Self>,
         messages: Vec<Message>,
     ) -> Result<(
         mpsc::Receiver<StreamChunk>,
-        oneshot::Receiver<Result<Vec<Message>>>,
+        oneshot::Receiver<Result<(Option<String>, Vec<Message>)>>,
     )> {
         let (tx, rx) = mpsc::channel(64);
         let (done_tx, done_rx) = oneshot::channel();
         let agent = Arc::clone(&self);
+        let session_id = agent.session_id().map(|s| s.to_string());
         let task = messages
             .iter()
             .rev()
@@ -471,7 +546,7 @@ impl KrabsAgent {
         tokio::task::spawn(async move {
             match agent.streaming_loop_inner(task, messages, tx.clone()).await {
                 Ok(final_messages) => {
-                    let _ = done_tx.send(Ok(final_messages));
+                    let _ = done_tx.send(Ok((session_id, final_messages)));
                 }
                 Err(e) => {
                     let _ = tx
@@ -504,8 +579,8 @@ impl KrabsAgent {
             .fire(&HookEvent::AgentStart { task: task.clone() })
             .await;
 
-        // Persist the initial user message (index 0 is system, skip it).
-        if let Some(user_msg) = messages.iter().find(|m| matches!(m.role, Role::User)) {
+        // Persist the newest user message (the one just submitted, at the end of history).
+        if let Some(user_msg) = messages.iter().rev().find(|m| matches!(m.role, Role::User)) {
             self.persist_message(user_msg, 0).await;
         }
 
@@ -530,6 +605,11 @@ impl KrabsAgent {
         }
 
         for turn in 0..self.config.max_turns {
+            // If the consumer (CLI) dropped its receiver (e.g. Ctrl+C), stop immediately.
+            if tx.is_closed() {
+                return Ok(messages);
+            }
+
             let system_prompt = self.current_system_prompt().await;
             if !system_prompt.is_empty() {
                 if messages
@@ -561,7 +641,7 @@ impl KrabsAgent {
 
             let (turn_tx, mut turn_rx) = mpsc::channel::<StreamChunk>(64);
             let turn_tx_retry = turn_tx.clone();
-            self.call_with_retry(turn, "llm_stream", || {
+            self.call_with_retry(turn, "llm_stream", Some(&tx), || {
                 let msgs = messages.clone();
                 let defs = tool_defs.clone();
                 let tx = turn_tx_retry.clone();
@@ -582,12 +662,13 @@ impl KrabsAgent {
                     StreamChunk::Done { usage } => {
                         usage_this_turn = Some(usage.clone());
                     }
+                    StreamChunk::Status { .. } => {}
                 }
-                if matches!(
-                    chunk,
-                    StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. }
-                ) {
-                    let _ = tx.send(chunk).await;
+                if matches!(chunk, StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. })
+                    && tx.send(chunk).await.is_err()
+                {
+                    // Consumer dropped (Ctrl+C) — stop the loop.
+                    return Ok(messages);
                 }
             }
 
@@ -650,42 +731,32 @@ impl KrabsAgent {
                     match self.registry.get(&call.name) {
                         Some(tool) => {
                             debug!("Calling tool: {} with args: {}", call.name, call.args);
-                            match tool.call(call.args.clone()).await {
-                                Ok(result) => {
-                                    let post = self
-                                        .hooks
-                                        .fire(&HookEvent::PostToolUse {
-                                            tool_name: call.name.clone(),
-                                            args: call.args.clone(),
-                                            result: result.content.clone(),
-                                            tool_use_id: call.id.clone(),
-                                        })
-                                        .await;
-                                    let content = if let HookOutput::AppendContext(ctx) = post {
-                                        format!("{}\n{}", result.content, ctx)
-                                    } else {
-                                        result.content
-                                    };
-                                    let result_msg =
-                                        Message::tool_result(&content, &call.id, &call.name);
-                                    self.persist_message(&result_msg, turn).await;
-                                    messages.push(result_msg);
-                                }
-                                Err(e) => {
-                                    self.hooks
-                                        .fire(&HookEvent::PostToolUseFailure {
-                                            tool_name: call.name.clone(),
-                                            args: call.args.clone(),
-                                            error: e.to_string(),
-                                            tool_use_id: call.id.clone(),
-                                        })
-                                        .await;
-                                    let result_msg =
-                                        Message::tool_result(e.to_string(), &call.id, &call.name);
-                                    self.persist_message(&result_msg, turn).await;
-                                    messages.push(result_msg);
-                                }
-                            }
+                            let result = self
+                                .call_tool_with_retry(
+                                    turn,
+                                    &call.name,
+                                    tool,
+                                    call.args.clone(),
+                                    Some(&tx),
+                                )
+                                .await;
+                            let post = self
+                                .hooks
+                                .fire(&HookEvent::PostToolUse {
+                                    tool_name: call.name.clone(),
+                                    args: call.args.clone(),
+                                    result: result.content.clone(),
+                                    tool_use_id: call.id.clone(),
+                                })
+                                .await;
+                            let content = if let HookOutput::AppendContext(ctx) = post {
+                                format!("{}\n{}", result.content, ctx)
+                            } else {
+                                result.content
+                            };
+                            let result_msg = Message::tool_result(&content, &call.id, &call.name);
+                            self.persist_message(&result_msg, turn).await;
+                            messages.push(result_msg);
                         }
                         None => {
                             let msg = format!("Tool not found: {}", call.name);
@@ -777,7 +848,7 @@ impl Agent for KrabsAgent {
                 messages.len()
             );
             let response = self
-                .call_with_retry(turn, "llm_complete", || {
+                .call_with_retry(turn, "llm_complete", None, || {
                     let msgs = messages.clone();
                     let defs = tool_defs.clone();
                     async move { self.provider.complete(&msgs, &defs).await }
@@ -865,45 +936,33 @@ impl Agent for KrabsAgent {
                         match self.registry.get(&call.name) {
                             Some(tool) => {
                                 debug!("Calling tool: {} with args: {}", call.name, call.args);
-                                match tool.call(call.args.clone()).await {
-                                    Ok(result) => {
-                                        let post = self
-                                            .hooks
-                                            .fire(&HookEvent::PostToolUse {
-                                                tool_name: call.name.clone(),
-                                                args: call.args.clone(),
-                                                result: result.content.clone(),
-                                                tool_use_id: call.id.clone(),
-                                            })
-                                            .await;
-                                        let content = if let HookOutput::AppendContext(ctx) = post {
-                                            format!("{}\n{}", result.content, ctx)
-                                        } else {
-                                            result.content
-                                        };
-                                        let result_msg =
-                                            Message::tool_result(&content, &call.id, &call.name);
-                                        self.persist_message(&result_msg, turn).await;
-                                        messages.push(result_msg);
-                                    }
-                                    Err(e) => {
-                                        self.hooks
-                                            .fire(&HookEvent::PostToolUseFailure {
-                                                tool_name: call.name.clone(),
-                                                args: call.args.clone(),
-                                                error: e.to_string(),
-                                                tool_use_id: call.id.clone(),
-                                            })
-                                            .await;
-                                        let result_msg = Message::tool_result(
-                                            e.to_string(),
-                                            &call.id,
-                                            &call.name,
-                                        );
-                                        self.persist_message(&result_msg, turn).await;
-                                        messages.push(result_msg);
-                                    }
-                                }
+                                let result = self
+                                    .call_tool_with_retry(
+                                        turn,
+                                        &call.name,
+                                        tool,
+                                        call.args.clone(),
+                                        None,
+                                    )
+                                    .await;
+                                let post = self
+                                    .hooks
+                                    .fire(&HookEvent::PostToolUse {
+                                        tool_name: call.name.clone(),
+                                        args: call.args.clone(),
+                                        result: result.content.clone(),
+                                        tool_use_id: call.id.clone(),
+                                    })
+                                    .await;
+                                let content = if let HookOutput::AppendContext(ctx) = post {
+                                    format!("{}\n{}", result.content, ctx)
+                                } else {
+                                    result.content
+                                };
+                                let result_msg =
+                                    Message::tool_result(&content, &call.id, &call.name);
+                                self.persist_message(&result_msg, turn).await;
+                                messages.push(result_msg);
                             }
                             None => {
                                 let msg = format!("Tool not found: {}", call.name);

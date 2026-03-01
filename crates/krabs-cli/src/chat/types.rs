@@ -118,8 +118,9 @@ pub(super) enum DisplayEvent {
     ToolCallStart(ToolCall),
     ToolResultEnd(String),
     TurnUsage(TokenUsage),
-    Done(Vec<Message>),
-    Error(String),
+    Done { messages: Vec<Message>, session_id: Option<String> },
+    Error { message: String, session_id: Option<String> },
+    Status(String),
 }
 
 /// Active permission prompt waiting for a user keypress.

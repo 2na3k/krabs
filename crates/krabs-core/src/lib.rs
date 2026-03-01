@@ -1,12 +1,12 @@
 pub mod agents;
 pub mod config;
-pub mod sandbox;
 pub mod hooks;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;
 pub mod prompts;
 pub mod providers;
+pub mod sandbox;
 pub mod session;
 pub mod skills;
 pub mod tools;
@@ -15,7 +15,6 @@ pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
 pub use agents::base_agent::BaseAgent;
 pub use agents::persona::AgentPersona;
 pub use config::config::{CustomModelEntry, KrabsConfig, SkillsConfig};
-pub use sandbox::{SandboxConfig, SandboxProxy, SandboxedTool};
 pub use config::credentials::Credentials;
 pub use hooks::{
     Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, ToolUseDecision,
@@ -26,6 +25,7 @@ pub use permissions::PermissionGuard;
 pub use providers::provider::{
     LlmProvider, LlmResponse, Message, Role, StreamChunk, TokenUsage, ToolCall,
 };
+pub use sandbox::{SandboxConfig, SandboxProxy, SandboxedTool};
 
 pub use providers::{AnthropicProvider, GeminiProvider, OpenAiProvider};
 pub use session::session::{Session, SessionStore, StoredCheckpoint, StoredError, StoredMessage};

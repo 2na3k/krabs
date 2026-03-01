@@ -88,6 +88,10 @@ pub struct KrabsConfig {
     /// Sandbox configuration for restricting agent capabilities.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// How many times to retry a failed tool call before letting the LLM see the error.
+    /// Default: 1 (2 total attempts — one try + one retry).
+    #[serde(default = "default_tool_max_retries")]
+    pub tool_max_retries: usize,
 }
 
 fn default_model() -> String {
@@ -118,6 +122,10 @@ fn default_retry_base_delay_ms() -> u64 {
     500
 }
 
+fn default_tool_max_retries() -> usize {
+    1
+}
+
 impl Default for KrabsConfig {
     fn default() -> Self {
         Self {
@@ -134,6 +142,7 @@ impl Default for KrabsConfig {
             max_retries: default_max_retries(),
             retry_base_delay_ms: default_retry_base_delay_ms(),
             sandbox: SandboxConfig::default(),
+            tool_max_retries: default_tool_max_retries(),
         }
     }
 }

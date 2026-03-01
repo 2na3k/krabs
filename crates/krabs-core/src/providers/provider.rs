@@ -111,6 +111,8 @@ pub enum StreamChunk {
     ToolCallReady { call: ToolCall },
     /// Final usage stats, signals end of stream
     Done { usage: TokenUsage },
+    /// Informational status message (e.g. tool retry notice)
+    Status { text: String },
 }
 
 #[async_trait]

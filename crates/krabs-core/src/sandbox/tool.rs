@@ -46,9 +46,7 @@ impl<T: Tool> Tool for SandboxedTool<T> {
             // ── read-like tools: guard the `path` arg ──────────────────────
             "read" | "glob" | "grep" => {
                 if let Some(path) = args["path"].as_str() {
-                    if let Err(reason) =
-                        self.config.check_read_path(std::path::Path::new(path))
-                    {
+                    if let Err(reason) = self.config.check_read_path(std::path::Path::new(path)) {
                         return Ok(ToolResult::err(reason));
                     }
                 }
@@ -58,9 +56,7 @@ impl<T: Tool> Tool for SandboxedTool<T> {
             // ── write tool: guard the `path` arg ───────────────────────────
             "write" => {
                 if let Some(path) = args["path"].as_str() {
-                    if let Err(reason) =
-                        self.config.check_write_path(std::path::Path::new(path))
-                    {
+                    if let Err(reason) = self.config.check_write_path(std::path::Path::new(path)) {
                         return Ok(ToolResult::err(reason));
                     }
                 }
@@ -114,11 +110,7 @@ impl<T: Tool> SandboxedTool<T> {
         Ok(ToolResult { content, is_error })
     }
 
-    async fn spawn_bash(
-        &self,
-        command: &str,
-        proxy_addr: &str,
-    ) -> Result<std::process::Output> {
+    async fn spawn_bash(&self, command: &str, proxy_addr: &str) -> Result<std::process::Output> {
         use tokio::process::Command;
 
         #[cfg(target_os = "macos")]

@@ -31,6 +31,8 @@ pub(super) struct App {
     pub(super) pending_permission: Option<PendingPermission>,
     /// Active user-input popup waiting for the user to select / confirm.
     pub(super) pending_user_input: Option<PendingUserInput>,
+    /// Message typed and submitted while a turn was running — dispatched on Done.
+    pub(super) queued_input: Option<String>,
 }
 
 impl App {
@@ -53,6 +55,7 @@ impl App {
             approved_tools: HashSet::new(),
             pending_permission: None,
             pending_user_input: None,
+            queued_input: None,
             system_prompt_text: String::new(),
             persona_text: String::new(),
             tools_text: String::new(),

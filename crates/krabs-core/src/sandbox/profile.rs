@@ -35,20 +35,12 @@ mod macos {
 
         // Allow writes to cwd
         if let Ok(cwd) = std::env::current_dir() {
-            writeln!(
-                sb,
-                "(allow file-write* (subpath \"{}\"))",
-                cwd.display()
-            )?;
+            writeln!(sb, "(allow file-write* (subpath \"{}\"))", cwd.display())?;
         }
 
         // Allowed write paths from config
         for path in &config.allowed_write_paths {
-            writeln!(
-                sb,
-                "(allow file-write* (subpath \"{}\"))",
-                path.display()
-            )?;
+            writeln!(sb, "(allow file-write* (subpath \"{}\"))", path.display())?;
         }
 
         // Standard temp dirs that bash needs
