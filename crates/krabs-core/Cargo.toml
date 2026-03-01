@@ -25,6 +25,7 @@ dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 serde_yaml = "0.9"
+tempfile = "3"
 
 [dev-dependencies]
 hyper = { version = "1", features = ["http1", "server"] }

@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod config;
+pub mod sandbox;
 pub mod hooks;
 pub mod mcp;
 pub mod memory;
@@ -14,6 +15,7 @@ pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
 pub use agents::base_agent::BaseAgent;
 pub use agents::persona::AgentPersona;
 pub use config::config::{CustomModelEntry, KrabsConfig, SkillsConfig};
+pub use sandbox::{SandboxConfig, SandboxProxy, SandboxedTool};
 pub use config::credentials::Credentials;
 pub use hooks::{
     Hook, HookConfig, HookEntry, HookEvent, HookOutput, HookRegistry, ToolUseDecision,

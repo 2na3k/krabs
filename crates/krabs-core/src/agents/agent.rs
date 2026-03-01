@@ -5,6 +5,7 @@ use crate::mcp::mcp::McpRegistry;
 use crate::memory::MemoryStore;
 use crate::permissions::PermissionGuard;
 use crate::providers::provider::{LlmProvider, LlmResponse, Message, Role, StreamChunk};
+use crate::sandbox::{SandboxProxy, SandboxedTool};
 use crate::session::session::{Session, SessionStore};
 use crate::skills::registry::SkillRegistry;
 use crate::tools::read_skill::ReadSkillTool;
@@ -47,6 +48,8 @@ pub struct KrabsAgent {
     /// not be opened (e.g. read-only filesystem). Every message and token-usage
     /// row is persisted here automatically by the agent loop.
     pub session: Option<Arc<Session>>,
+    /// Sandbox proxy — kept alive for the lifetime of the agent.
+    _sandbox_proxy: Option<SandboxProxy>,
     total_input_tokens: std::sync::atomic::AtomicU32,
     total_output_tokens: std::sync::atomic::AtomicU32,
 }
@@ -141,6 +144,38 @@ impl KrabsAgentBuilder {
             }
         }
 
+        // Start sandbox proxy and register sandboxed tool variants if enabled.
+        let sandbox_proxy = if self.config.sandbox.enabled {
+            let sandbox_cfg = Arc::new(self.config.sandbox.clone());
+            match SandboxProxy::start(Arc::clone(&sandbox_cfg)).await {
+                Ok(proxy) => {
+                    let port = proxy.port();
+                    self.registry.register(Arc::new(SandboxedTool::wrap(
+                        crate::tools::bash::BashTool,
+                        Arc::clone(&sandbox_cfg),
+                        port,
+                    )));
+                    self.registry.register(Arc::new(SandboxedTool::wrap(
+                        crate::tools::read::ReadTool,
+                        Arc::clone(&sandbox_cfg),
+                        port,
+                    )));
+                    self.registry.register(Arc::new(SandboxedTool::wrap(
+                        crate::tools::write::WriteTool,
+                        Arc::clone(&sandbox_cfg),
+                        port,
+                    )));
+                    Some(proxy)
+                }
+                Err(e) => {
+                    warn!("Failed to start sandbox proxy: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let provider_name = crate::providers::provider_name_from_url(&self.config.base_url);
         let session = match SessionStore::open(&self.config.db_path).await {
             Ok(store) => {
@@ -189,6 +224,7 @@ impl KrabsAgentBuilder {
             skills: self.skills,
             hooks: self.hooks,
             session,
+            _sandbox_proxy: sandbox_proxy,
             total_input_tokens: std::sync::atomic::AtomicU32::new(0),
             total_output_tokens: std::sync::atomic::AtomicU32::new(0),
         })
@@ -208,6 +244,7 @@ impl KrabsAgentBuilder {
             skills: self.skills,
             hooks: self.hooks,
             session: None,
+            _sandbox_proxy: None,
             total_input_tokens: std::sync::atomic::AtomicU32::new(0),
             total_output_tokens: std::sync::atomic::AtomicU32::new(0),
         })
@@ -234,6 +271,7 @@ impl KrabsAgent {
             skills: None,
             hooks: HookRegistry::default(),
             session: None,
+            _sandbox_proxy: None,
             total_input_tokens: std::sync::atomic::AtomicU32::new(0),
             total_output_tokens: std::sync::atomic::AtomicU32::new(0),
         }
@@ -288,7 +326,7 @@ impl KrabsAgent {
 
         stored
             .iter()
-            .map(|s| crate::session::session::Session::stored_to_message(s))
+            .map(crate::session::session::Session::stored_to_message)
             .collect()
     }
 

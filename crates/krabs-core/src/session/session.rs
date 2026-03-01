@@ -353,7 +353,7 @@ impl Session {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|r| Self::row_to_stored(r)).collect()
+        rows.into_iter().map(Self::row_to_stored).collect()
     }
 
     /// Hard-delete messages written after `last_msg_id` (incomplete turn rollback).
@@ -411,7 +411,7 @@ impl Session {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|r| Self::row_to_stored(r)).collect()
+        rows.into_iter().map(Self::row_to_stored).collect()
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<StoredMessage>> {
@@ -426,7 +426,7 @@ impl Session {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(|r| Self::row_to_stored(r)).collect()
+        rows.into_iter().map(Self::row_to_stored).collect()
     }
 
     pub async fn token_usage(&self) -> Result<Vec<StoredTokenUsage>> {

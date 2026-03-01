@@ -3,32 +3,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::{Client, Method};
 use serde_json::json;
+use std::sync::LazyLock;
 
-pub struct WebFetchTool {
-    client: Client,
-}
+static CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .user_agent("krabs/0.1")
+        .build()
+        .expect("failed to build reqwest client")
+});
 
-impl WebFetchTool {
-    pub fn new() -> Self {
-        Self {
-            client: Client::builder()
-                .user_agent("krabs/0.1")
-                .build()
-                .expect("failed to build reqwest client"),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn with_client(client: Client) -> Self {
-        Self { client }
-    }
-}
-
-impl Default for WebFetchTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub struct WebFetchTool;
 
 #[async_trait]
 impl Tool for WebFetchTool {
@@ -71,47 +55,51 @@ impl Tool for WebFetchTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let url = args["url"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'url' argument"))?;
+        fetch_with_client(&CLIENT, args).await
+    }
+}
 
-        let method = match args["method"].as_str().unwrap_or("GET") {
-            "POST" => Method::POST,
-            _ => Method::GET,
-        };
+async fn fetch_with_client(client: &Client, args: serde_json::Value) -> Result<ToolResult> {
+    let url = args["url"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'url' argument"))?;
 
-        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30);
+    let method = match args["method"].as_str().unwrap_or("GET") {
+        "POST" => Method::POST,
+        _ => Method::GET,
+    };
 
-        let mut req = self.client.request(method, url).timeout(
-            std::time::Duration::from_secs(timeout_secs),
-        );
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30);
 
-        if let Some(headers) = args["headers"].as_object() {
-            for (k, v) in headers {
-                if let Some(v) = v.as_str() {
-                    req = req.header(k.as_str(), v);
-                }
+    let mut req = client
+        .request(method, url)
+        .timeout(std::time::Duration::from_secs(timeout_secs));
+
+    if let Some(headers) = args["headers"].as_object() {
+        for (k, v) in headers {
+            if let Some(v) = v.as_str() {
+                req = req.header(k.as_str(), v);
             }
         }
-
-        if let Some(body) = args["body"].as_str() {
-            req = req.body(body.to_string());
-        }
-
-        let response = req.send().await.map_err(|e| anyhow::anyhow!("Request failed: {e}"))?;
-
-        let status = response.status();
-        let is_error = status.is_client_error() || status.is_server_error();
-
-        let body = response
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read response body: {e}"))?;
-
-        let content = format!("HTTP {}\n\n{}", status.as_u16(), body);
-
-        Ok(ToolResult { content, is_error })
     }
+
+    if let Some(body) = args["body"].as_str() {
+        req = req.body(body.to_string());
+    }
+
+    let response = req.send().await.map_err(|e| anyhow::anyhow!("Request failed: {e}"))?;
+
+    let status = response.status();
+    let is_error = status.is_client_error() || status.is_server_error();
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read response body: {e}"))?;
+
+    let content = format!("HTTP {}\n\n{}", status.as_u16(), body);
+
+    Ok(ToolResult { content, is_error })
 }
 
 #[cfg(test)]
@@ -149,20 +137,25 @@ mod tests {
         addr
     }
 
-    fn tool() -> WebFetchTool {
-        WebFetchTool::new()
+    // Tests call fetch_with_client directly with a fresh client to avoid
+    // the global CLIENT and keep tests independent.
+    fn test_client() -> Client {
+        Client::builder()
+            .user_agent("krabs-test/0.1")
+            .build()
+            .unwrap()
     }
 
-    // --- parameter validation ---
+    async fn call(args: serde_json::Value) -> Result<ToolResult> {
+        fetch_with_client(&test_client(), args).await
+    }
 
     #[tokio::test]
     async fn missing_url_returns_error() {
-        let result = tool().call(json!({})).await;
+        let result = call(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("url"));
     }
-
-    // --- GET ---
 
     #[tokio::test]
     async fn get_200_returns_body() {
@@ -171,8 +164,7 @@ mod tests {
         })
         .await;
 
-        let result = tool()
-            .call(json!({ "url": format!("http://{addr}/") }))
+        let result = call(json!({ "url": format!("http://{addr}/") }))
             .await
             .unwrap();
 
@@ -193,8 +185,7 @@ mod tests {
         })
         .await;
 
-        let result = tool()
-            .call(json!({ "url": format!("http://{addr}/missing") }))
+        let result = call(json!({ "url": format!("http://{addr}/missing") }))
             .await
             .unwrap();
 
@@ -214,16 +205,13 @@ mod tests {
         })
         .await;
 
-        let result = tool()
-            .call(json!({ "url": format!("http://{addr}/boom") }))
+        let result = call(json!({ "url": format!("http://{addr}/boom") }))
             .await
             .unwrap();
 
         assert!(result.is_error);
         assert!(result.content.contains("500"));
     }
-
-    // --- POST ---
 
     #[tokio::test]
     async fn post_sends_body_and_returns_response() {
@@ -237,20 +225,17 @@ mod tests {
         })
         .await;
 
-        let result = tool()
-            .call(json!({
-                "url": format!("http://{addr}/"),
-                "method": "POST",
-                "body": "ping"
-            }))
-            .await
-            .unwrap();
+        let result = call(json!({
+            "url": format!("http://{addr}/"),
+            "method": "POST",
+            "body": "ping"
+        }))
+        .await
+        .unwrap();
 
         assert!(!result.is_error);
         assert!(result.content.contains("echo: ping"));
     }
-
-    // --- headers ---
 
     #[tokio::test]
     async fn custom_headers_are_forwarded() {
@@ -265,37 +250,32 @@ mod tests {
         })
         .await;
 
-        let result = tool()
-            .call(json!({
-                "url": format!("http://{addr}/"),
-                "headers": { "x-krabs-test": "sentinel" }
-            }))
-            .await
-            .unwrap();
+        let result = call(json!({
+            "url": format!("http://{addr}/"),
+            "headers": { "x-krabs-test": "sentinel" }
+        }))
+        .await
+        .unwrap();
 
         assert!(!result.is_error);
         assert!(result.content.contains("sentinel"));
     }
-
-    // --- timeout ---
 
     #[tokio::test]
     async fn timeout_returns_err() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Accept but never reply — simulates a hung server.
         tokio::spawn(async move {
             let (_stream, _) = listener.accept().await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         });
 
-        let result = tool()
-            .call(json!({
-                "url": format!("http://{addr}/"),
-                "timeout_secs": 1
-            }))
-            .await;
+        let result = call(json!({
+            "url": format!("http://{addr}/"),
+            "timeout_secs": 1
+        }))
+        .await;
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();

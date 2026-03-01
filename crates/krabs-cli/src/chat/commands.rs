@@ -604,7 +604,7 @@ pub(super) fn build_registry() -> ToolRegistry {
     r.register(Arc::new(GlobTool));
     r.register(Arc::new(GrepTool));
     r.register(Arc::new(ReadTool));
-    r.register(Arc::new(WebFetchTool::new()));
+    r.register(Arc::new(WebFetchTool));
     r.register(Arc::new(WriteTool));
     r
 }

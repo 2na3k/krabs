@@ -1,3 +1,4 @@
+use crate::sandbox::SandboxConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -84,6 +85,9 @@ pub struct KrabsConfig {
     /// Base delay in milliseconds for exponential backoff between retries.
     #[serde(default = "default_retry_base_delay_ms")]
     pub retry_base_delay_ms: u64,
+    /// Sandbox configuration for restricting agent capabilities.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 fn default_model() -> String {
@@ -129,6 +133,7 @@ impl Default for KrabsConfig {
             custom_models: Vec::new(),
             max_retries: default_max_retries(),
             retry_base_delay_ms: default_retry_base_delay_ms(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }
