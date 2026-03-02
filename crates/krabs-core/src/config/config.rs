@@ -195,6 +195,10 @@ fn default_entry_provider() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KrabsConfig {
+    /// Override the provider (e.g. `"openai"`, `"anthropic"`, `"gemini"`).
+    /// Empty string means "infer from base_url / credentials".
+    #[serde(default)]
+    pub provider: String,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default = "default_base_url")]
@@ -275,6 +279,7 @@ fn default_tool_max_retries() -> usize {
 impl Default for KrabsConfig {
     fn default() -> Self {
         Self {
+            provider: String::new(),
             model: default_model(),
             base_url: default_base_url(),
             api_key: std::env::var("KRABS_API_KEY")

@@ -36,6 +36,21 @@ async fn recv_event(rx: &mut Option<mpsc::Receiver<DisplayEvent>>) -> Option<Dis
 pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
     let krabs_config = KrabsConfig::load().unwrap_or_default();
     let mut creds = creds;
+    // Apply krabs_config overrides into creds so .krabs.json / config.json
+    // values take precedence over credentials.json.
+    let default_cfg = KrabsConfig::default();
+    if !krabs_config.provider.is_empty() {
+        creds.provider = krabs_config.provider.clone();
+    }
+    if krabs_config.model != default_cfg.model {
+        creds.model = krabs_config.model.clone();
+    }
+    if krabs_config.base_url != default_cfg.base_url {
+        creds.base_url = krabs_config.base_url.clone();
+    }
+    if !krabs_config.api_key.is_empty() && krabs_config.api_key != creds.api_key {
+        creds.api_key = krabs_config.api_key.clone();
+    }
     let mut provider: Arc<dyn LlmProvider> = Arc::from(creds.build_provider());
     let registry = Arc::new(build_registry());
     let mut max_ctx = context_limit(&creds.model);
@@ -242,6 +257,51 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                 }
 
                 let busy = app.spinning || stream_rx.is_some();
+
+                // ── Model picker popup ────────────────────────────────────────
+                if app.model_picker.is_some() {
+                    match key.code {
+                        KeyCode::Up => {
+                            let p = app.model_picker.as_mut().unwrap();
+                            if p.cursor > 0 {
+                                p.cursor -= 1;
+                                if p.cursor < p.scroll {
+                                    p.scroll = p.cursor;
+                                }
+                            }
+                        }
+                        KeyCode::Down => {
+                            let p = app.model_picker.as_mut().unwrap();
+                            if p.cursor + 1 < p.entries.len() {
+                                p.cursor += 1;
+                                if p.cursor >= p.scroll + 10 {
+                                    p.scroll = p.cursor.saturating_sub(9);
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(picker) = app.model_picker.take() {
+                                let entry = &picker.entries[picker.cursor];
+                                super::commands::apply_model_entry(
+                                    entry,
+                                    &mut creds,
+                                    &mut provider,
+                                    &mut info,
+                                    &mut max_ctx,
+                                );
+                                app.push(ChatMsg::Info(format!(
+                                    "switched to {} / {} ({})",
+                                    creds.provider, creds.model, creds.base_url
+                                )));
+                            }
+                        }
+                        KeyCode::Esc => {
+                            app.model_picker = None;
+                        }
+                        _ => {}
+                    }
+                    continue 'main;
+                }
 
                 // Scroll (always available)
                 match key.code {
@@ -675,7 +735,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                             s if s == "/models" || s.starts_with("/models ") => {
                                 let args = s.strip_prefix("/models").unwrap_or("").trim();
                                 cmd_models(
-                                    &mut app, args, &mut creds,
+                                    &mut app, args, &creds,
                                     &mut provider, &mut info, &mut max_ctx,
                                     &krabs_config.custom_models,
                                 );

@@ -147,6 +147,29 @@ pub(super) struct PendingUserInput {
     pub(super) respond: oneshot::Sender<String>,
 }
 
+/// One selectable row in the model picker popup.
+pub(super) struct ModelEntry {
+    /// Display group label (e.g. "anthropic", "custom").
+    pub(super) group: String,
+    /// Short display name shown in the list.
+    pub(super) label: String,
+    /// Provider string written to `creds.provider`.
+    pub(super) provider: String,
+    /// Model id written to `creds.model`.
+    pub(super) model: String,
+    /// Base URL — `None` means keep current.
+    pub(super) base_url: Option<String>,
+    /// API key — `None` means keep current.
+    pub(super) api_key: Option<String>,
+}
+
+pub(super) struct ModelPicker {
+    pub(super) entries: Vec<ModelEntry>,
+    pub(super) cursor: usize,
+    /// Vertical scroll offset (first visible entry index).
+    pub(super) scroll: usize,
+}
+
 pub(super) struct InfoBar {
     pub(super) provider: String,
     pub(super) model: String,

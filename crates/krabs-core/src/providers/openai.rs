@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub struct OpenAiProvider {
@@ -20,8 +21,12 @@ impl OpenAiProvider {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
@@ -149,8 +154,7 @@ impl LlmProvider for OpenAiProvider {
         let mut body = json!({
             "model": self.model,
             "messages": msgs,
-            "stream": true,
-            "stream_options": { "include_usage": true }
+            "stream": true
         });
         if !tools_val.is_empty() {
             body["tools"] = json!(tools_val);
@@ -177,7 +181,17 @@ impl LlmProvider for OpenAiProvider {
         let mut byte_stream = raw_resp.bytes_stream();
         let mut leftover = String::new();
 
-        'outer: while let Some(chunk) = byte_stream.next().await {
+        // 120-second idle timeout per chunk — prevents infinite hang when
+        // the server stops sending data (e.g. llama.cpp after tool results).
+        const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+        'outer: loop {
+            let maybe = tokio::time::timeout(IDLE_TIMEOUT, byte_stream.next()).await;
+            let chunk = match maybe {
+                Ok(Some(c)) => c,
+                Ok(None) => break 'outer,
+                Err(_) => anyhow::bail!("stream idle timeout after {IDLE_TIMEOUT:?}"),
+            };
             let bytes = chunk?;
             leftover.push_str(&String::from_utf8_lossy(&bytes));
 

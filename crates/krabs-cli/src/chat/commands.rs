@@ -7,7 +7,7 @@ use krabs_core::{
 };
 
 use super::app::App;
-use super::types::{ChatMsg, InfoBar};
+use super::types::{ChatMsg, InfoBar, ModelEntry, ModelPicker};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -26,10 +26,7 @@ pub(super) const SLASH_COMMANDS: &[(&str, &str)] = &[
         "list/add/remove hooks  usage: /hooks [list|add|remove]",
     ),
     ("/agents", "list agent personas  |  use @<name> to activate"),
-    (
-        "/models",
-        "list or switch models  usage: /models [<model> | <provider> <model>]",
-    ),
+    ("/models", "open model picker"),
     ("/usage", "show context window usage"),
     ("/clear", "clear screen and conversation"),
     ("/resume", "resume a session  usage: /resume <session-id>"),
@@ -146,111 +143,120 @@ pub(super) fn cmd_agents(app: &mut App, args: &str) {
     }
 }
 
-/// /models                    — list known + custom models
-/// /models <name|model>       — switch by custom entry name or model id (keep provider)
-/// /models <provider> <model> — switch provider and model
-pub(super) fn cmd_models(
-    app: &mut App,
-    args: &str,
+/// Build the full list of selectable model entries for the picker.
+pub(super) fn build_model_entries(
+    creds: &Credentials,
+    custom_models: &[CustomModelEntry],
+) -> (Vec<ModelEntry>, usize) {
+    let mut entries: Vec<ModelEntry> = Vec::new();
+
+    // Built-in known models
+    for (prov, models) in KNOWN_MODELS {
+        for m in *models {
+            entries.push(ModelEntry {
+                group: prov.trim().to_string(),
+                label: m.to_string(),
+                provider: prov.trim().to_string(),
+                model: m.to_string(),
+                base_url: None,
+                api_key: None,
+            });
+        }
+    }
+
+    // Custom model entries from config
+    for entry in custom_models {
+        entries.push(ModelEntry {
+            group: "custom".into(),
+            label: format!("{} ({})", entry.name, entry.model),
+            provider: entry.provider.clone(),
+            model: entry.model.clone(),
+            base_url: Some(entry.base_url.clone()),
+            api_key: if entry.api_key.is_empty() {
+                None
+            } else {
+                Some(entry.api_key.clone())
+            },
+        });
+    }
+
+    // If the current active model isn't in any group, inject it at the top
+    // so it's always visible and selectable (e.g. a local llama.cpp model
+    // configured via base_url in .krabs.json).
+    // An entry counts as "present" only if the model name matches AND either
+    // the entry is a standard known model (no explicit base_url) with the same
+    // name, OR it's a custom entry with an exact base_url match.
+    let already_present = entries.iter().any(|e| {
+        e.model == creds.model
+            && (e.base_url.is_none()
+                || e.base_url.as_deref() == Some(creds.base_url.as_str()))
+    });
+    if !already_present {
+        entries.insert(
+            0,
+            ModelEntry {
+                group: "active".into(),
+                label: creds.model.clone(),
+                provider: creds.provider.clone(),
+                model: creds.model.clone(),
+                base_url: Some(creds.base_url.clone()),
+                api_key: None,
+            },
+        );
+    }
+
+    // Find index of active model
+    let active = entries
+        .iter()
+        .position(|e| {
+            e.model == creds.model
+                && (e.base_url.is_none()
+                    || e.base_url.as_deref() == Some(creds.base_url.as_str()))
+        })
+        .unwrap_or(0);
+
+    (entries, active)
+}
+
+/// Apply a selected ModelEntry to the live credentials + provider.
+pub(super) fn apply_model_entry(
+    entry: &ModelEntry,
     creds: &mut Credentials,
     provider: &mut Arc<dyn LlmProvider>,
     info: &mut InfoBar,
     max_ctx: &mut u32,
+) {
+    creds.provider = entry.provider.clone();
+    creds.model = entry.model.clone();
+    if let Some(url) = &entry.base_url {
+        creds.base_url = url.clone();
+    }
+    if let Some(key) = &entry.api_key {
+        creds.api_key = key.clone();
+    }
+    *provider = Arc::from(creds.build_provider());
+    *max_ctx = context_limit(&creds.model);
+    info.provider = creds.provider.clone();
+    info.model = creds.model.clone();
+}
+
+/// /models — always opens the interactive model picker popup.
+pub(super) fn cmd_models(
+    app: &mut App,
+    _args: &str,
+    creds: &Credentials,
+    _provider: &mut Arc<dyn LlmProvider>,
+    _info: &mut InfoBar,
+    _max_ctx: &mut u32,
     custom_models: &[CustomModelEntry],
 ) {
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    match parts.as_slice() {
-        // /models — list
-        [] => {
-            app.push(ChatMsg::Info(format!(
-                "current: {}  {}  ({})",
-                creds.provider, creds.model, creds.base_url
-            )));
-            app.push(ChatMsg::Info(String::new()));
-
-            // Built-in known models
-            for (prov, models) in KNOWN_MODELS {
-                app.push(ChatMsg::Info(format!("  {}:", prov)));
-                for m in *models {
-                    let active = *prov == creds.provider && *m == creds.model;
-                    let marker = if active { " ◀" } else { "" };
-                    app.push(ChatMsg::Info(format!("    {}{}", m, marker)));
-                }
-            }
-
-            // Custom models from config
-            if !custom_models.is_empty() {
-                app.push(ChatMsg::Info(String::new()));
-                app.push(ChatMsg::Info("  custom (from config):".into()));
-                for entry in custom_models {
-                    let active = entry.provider == creds.provider
-                        && entry.model == creds.model
-                        && entry.base_url == creds.base_url;
-                    let marker = if active { " ◀" } else { "" };
-                    app.push(ChatMsg::Info(format!(
-                        "    {:<20}  {}  {}  {}{}",
-                        entry.name, entry.provider, entry.model, entry.base_url, marker
-                    )));
-                }
-            }
-
-            app.push(ChatMsg::Info(String::new()));
-            app.push(ChatMsg::Info(
-                "  usage: /models <name|model>  |  /models <provider> <model>".into(),
-            ));
-        }
-
-        // /models <name|model> — check custom entries first, then fall back to model-id switch
-        [name_or_model] => {
-            if let Some(entry) = custom_models.iter().find(|e| e.name == *name_or_model) {
-                // Matched a named custom entry — apply all its fields
-                creds.provider = entry.provider.clone();
-                creds.model = entry.model.clone();
-                creds.base_url = entry.base_url.clone();
-                if !entry.api_key.is_empty() {
-                    creds.api_key = entry.api_key.clone();
-                }
-                *provider = Arc::from(creds.build_provider());
-                *max_ctx = context_limit(&creds.model);
-                info.provider = creds.provider.clone();
-                info.model = creds.model.clone();
-                app.push(ChatMsg::Info(format!(
-                    "switched to custom model '{}' → {}  {}  ({})",
-                    entry.name, creds.provider, creds.model, creds.base_url
-                )));
-            } else {
-                // Treat as a bare model id — keep current provider and base_url
-                creds.model = name_or_model.to_string();
-                *provider = Arc::from(creds.build_provider());
-                *max_ctx = context_limit(&creds.model);
-                info.model = creds.model.clone();
-                app.push(ChatMsg::Info(format!(
-                    "switched model → {}  {}",
-                    creds.provider, creds.model
-                )));
-            }
-        }
-
-        // /models <provider> <model>
-        [prov, model] => {
-            creds.provider = prov.to_string();
-            creds.model = model.to_string();
-            *provider = Arc::from(creds.build_provider());
-            *max_ctx = context_limit(&creds.model);
-            info.provider = creds.provider.clone();
-            info.model = creds.model.clone();
-            app.push(ChatMsg::Info(format!(
-                "switched → {}  {}",
-                creds.provider, creds.model
-            )));
-        }
-
-        _ => {
-            app.push(ChatMsg::Error(
-                "usage: /models [<name|model> | <provider> <model>]".into(),
-            ));
-        }
-    }
+    let (entries, active) = build_model_entries(creds, custom_models);
+    let scroll = active.saturating_sub(4);
+    app.model_picker = Some(ModelPicker {
+        entries,
+        cursor: active,
+        scroll,
+    });
 }
 
 pub(super) fn cmd_tools(app: &mut App, registry: &ToolRegistry) {

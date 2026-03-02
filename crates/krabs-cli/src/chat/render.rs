@@ -381,6 +381,83 @@ pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Fr
         frame.render_widget(popup, pop_rect);
     }
 
+    // ── model picker popup ───────────────────────────────────────────────────
+    if let Some(ref picker) = app.model_picker {
+        let pop_w = (area.width * 3 / 4).clamp(52, 82);
+        // Show at most 10 rows; cap to actual list size
+        let visible = 10usize.min(picker.entries.len());
+        // inner height: 1 padding + visible rows + 1 hint = visible + 2
+        // outer height: inner + 2 borders
+        let pop_h = (visible as u16) + 4;
+        let pop_x = area.x + (area.width.saturating_sub(pop_w)) / 2;
+        let pop_y = area.y + (area.height.saturating_sub(pop_h)) / 2;
+        let pop_rect = ratatui::layout::Rect::new(pop_x, pop_y, pop_w, pop_h);
+
+        let mut lines: Vec<Line> = vec![Line::raw("")];
+
+        let end = (picker.scroll + visible).min(picker.entries.len());
+        for (i, entry) in picker.entries[picker.scroll..end].iter().enumerate() {
+            let abs = picker.scroll + i;
+            let focused = abs == picker.cursor;
+
+            let (prefix_style, label_style, group_style) = if focused {
+                let bg = Style::default().fg(Color::Black).bg(Color::Green);
+                (bg, bg.add_modifier(Modifier::BOLD), bg)
+            } else {
+                (
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::White),
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+
+            let prefix = if focused { " ▶ " } else { "   " };
+
+            // Right-side annotation: base_url for custom/active, group for known
+            let annotation = if let Some(u) = &entry.base_url {
+                let u = u.trim_start_matches("http://").trim_start_matches("https://");
+                format!("  {}", u)
+            } else {
+                format!("  [{}]", entry.group)
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix, prefix_style),
+                Span::styled(entry.label.clone(), label_style),
+                Span::styled(annotation, group_style),
+            ]));
+        }
+
+        // Footer: position indicator + hint on one line
+        let total = picker.entries.len();
+        let shown_end = end;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}-{}/{}", picker.scroll + 1, shown_end, total),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "   ↑↓ move   enter select   esc close",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        let popup = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green))
+                .title(Span::styled(
+                    " ⚙ switch model ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        );
+
+        frame.render_widget(ratatui::widgets::Clear, pop_rect);
+        frame.render_widget(popup, pop_rect);
+    }
+
     // @<name> suggestion popup
     if !app.spinning && app.input.starts_with('@') && !app.input.contains(' ') {
         let prefix = &app.input[1..];

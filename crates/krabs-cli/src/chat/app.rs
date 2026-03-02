@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use krabs_core::AgentPersona;
 
-use super::types::{ChatMsg, PendingPermission, PendingUserInput};
+use super::types::{ChatMsg, ModelPicker, PendingPermission, PendingUserInput};
 
 // ── app state ────────────────────────────────────────────────────────────────
 
@@ -33,6 +33,8 @@ pub(super) struct App {
     pub(super) pending_user_input: Option<PendingUserInput>,
     /// Message typed and submitted while a turn was running — dispatched on Done.
     pub(super) queued_input: Option<String>,
+    /// Open model picker popup (None = closed).
+    pub(super) model_picker: Option<ModelPicker>,
 }
 
 impl App {
@@ -56,6 +58,7 @@ impl App {
             pending_permission: None,
             pending_user_input: None,
             queued_input: None,
+            model_picker: None,
             system_prompt_text: String::new(),
             persona_text: String::new(),
             tools_text: String::new(),
