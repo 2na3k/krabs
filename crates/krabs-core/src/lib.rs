@@ -47,3 +47,9 @@ pub use tools::user_input::{InputMode, UserInputRequest, UserInputTool};
 pub use tools::web_fetch::WebFetchTool;
 pub use tools::write::WriteTool;
 pub use tools::ReadSkillTool;
+
+/// Generate a fresh session UUID (used by the CLI to pre-assign a session ID
+/// before the first message is sent, so it can be shown in the UI immediately).
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}

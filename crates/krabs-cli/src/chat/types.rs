@@ -175,6 +175,7 @@ pub(super) struct InfoBar {
     pub(super) model: String,
     pub(super) cwd: String,
     pub(super) tools: String,
+    pub(super) session_id: Option<String>,
 }
 
 pub(super) fn estimate_tokens(s: &str) -> u32 {

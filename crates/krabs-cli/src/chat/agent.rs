@@ -64,6 +64,20 @@ impl krabs_core::Hook for TuiHook {
                     .await;
                 Ok(HookOutput::Continue)
             }
+            // Signal each new LLM turn so the user can see the agent is
+            // continuing rather than frozen after a tool result.
+            HookEvent::TurnStart { turn } => {
+                if *turn > 0 {
+                    let _ = self
+                        .tx
+                        .send(DisplayEvent::Status(format!(
+                            "⟳ synthesizing (turn {})…",
+                            turn + 1
+                        )))
+                        .await;
+                }
+                Ok(HookOutput::Continue)
+            }
             _ => Ok(HookOutput::Continue),
         }
     }
@@ -73,6 +87,7 @@ impl krabs_core::Hook for TuiHook {
 
 /// Build a per-turn `KrabsAgent` with the given provider, registry, system
 /// prompt, and a `TuiHook` wired to the display-event channel.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_agent(
     config: &krabs_core::KrabsConfig,
     provider: Arc<dyn LlmProvider>,
@@ -81,6 +96,7 @@ pub(super) async fn build_agent(
     tx: mpsc::Sender<DisplayEvent>,
     perm: SharedPerm,
     resume_session_id: Option<String>,
+    initial_session_id: Option<String>,
 ) -> Arc<krabs_core::KrabsAgent> {
     use krabs_core::{DelegateTool, DispatchTool, UserInputTool};
 
@@ -120,7 +136,10 @@ pub(super) async fn build_agent(
         .hook(Arc::new(TuiHook { tx, perm }));
     let builder = match resume_session_id {
         Some(sid) => builder.resume_session(sid),
-        None => builder,
+        None => match initial_session_id {
+            Some(sid) => builder.session_id(sid),
+            None => builder,
+        },
     };
     builder.build_async().await
 }

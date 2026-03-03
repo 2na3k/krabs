@@ -36,7 +36,7 @@ pub fn run_setup() -> Result<Credentials> {
         "3" => (
             "gemini",
             "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
-            "gemini-2.0-flash".to_string(),
+            "gemini-3-flash-preview".to_string(),
         ),
         "4" => (
             "ollama",

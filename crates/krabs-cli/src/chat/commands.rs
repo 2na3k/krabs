@@ -54,6 +54,7 @@ pub(super) const KNOWN_MODELS: &[(&str, &[&str])] = &[
             "gemini-2.0-flash-lite",
             "gemini-1.5-pro",
             "gemini-1.5-flash",
+            "gemini-3-flash-preview",
         ],
     ),
     (
@@ -188,8 +189,7 @@ pub(super) fn build_model_entries(
     // name, OR it's a custom entry with an exact base_url match.
     let already_present = entries.iter().any(|e| {
         e.model == creds.model
-            && (e.base_url.is_none()
-                || e.base_url.as_deref() == Some(creds.base_url.as_str()))
+            && (e.base_url.is_none() || e.base_url.as_deref() == Some(creds.base_url.as_str()))
     });
     if !already_present {
         entries.insert(
@@ -210,8 +210,7 @@ pub(super) fn build_model_entries(
         .iter()
         .position(|e| {
             e.model == creds.model
-                && (e.base_url.is_none()
-                    || e.base_url.as_deref() == Some(creds.base_url.as_str()))
+                && (e.base_url.is_none() || e.base_url.as_deref() == Some(creds.base_url.as_str()))
         })
         .unwrap_or(0);
 

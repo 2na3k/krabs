@@ -242,6 +242,11 @@ pub struct KrabsConfig {
     /// Example: `["bash", "read_file", "web_fetch"]`
     #[serde(default)]
     pub auto_approve_tools: Vec<String>,
+    /// Maximum length (in characters) of a tool result before it is truncated.
+    /// Prevents context-overflow errors when tools return large outputs (e.g. web pages).
+    /// Set to 0 to disable truncation. Default: 8000.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
 }
 
 fn default_model() -> String {
@@ -276,6 +281,10 @@ fn default_tool_max_retries() -> usize {
     1
 }
 
+fn default_max_tool_result_chars() -> usize {
+    8000
+}
+
 impl Default for KrabsConfig {
     fn default() -> Self {
         Self {
@@ -298,6 +307,7 @@ impl Default for KrabsConfig {
             langfuse: LangfuseConfig::default(),
             router: RouterConfig::default(),
             auto_approve_tools: Vec::new(),
+            max_tool_result_chars: default_max_tool_result_chars(),
         }
     }
 }

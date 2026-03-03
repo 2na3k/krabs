@@ -31,7 +31,12 @@ pub(super) const MR_KRABS_ORANGE: Color = Color::Rgb(255, 128, 0);
 
 pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Frame) {
     let area = frame.area();
-    let info_height: u16 = if app.active_persona.is_some() { 7 } else { 6 };
+    let has_session = info.session_id.is_some();
+    let info_height: u16 = match (app.active_persona.is_some(), has_session) {
+        (true, true) => 8,
+        (true, false) | (false, true) => 7,
+        (false, false) => 6,
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -110,6 +115,16 @@ pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Fr
             spans
         }),
     ];
+    if let Some(ref sid) = info.session_id {
+        let short = &sid[..sid.len().min(8)];
+        info_lines.push(Line::from(vec![
+            Span::styled("  session ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                short.to_string(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     if let Some(ref persona) = app.active_persona {
         info_lines.push(Line::from(vec![
             Span::styled("  persona ", Style::default().fg(Color::DarkGray)),

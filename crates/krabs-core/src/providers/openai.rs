@@ -229,13 +229,19 @@ impl LlmProvider for OpenAiProvider {
                 let msg_delta = &choice["delta"];
                 let finish_reason = choice["finish_reason"].as_str().unwrap_or("");
 
-                if let Some(text) = msg_delta["content"].as_str() {
-                    if !text.is_empty() {
-                        let _ = tx
-                            .send(StreamChunk::Delta {
-                                text: text.to_string(),
-                            })
-                            .await;
+                // Some models (e.g. Qwen3 with thinking mode) stream their
+                // chain-of-thought in a `reasoning_content` field and then
+                // output the final answer in `content`.  Surface both so the
+                // user can see the thinking process and the response.
+                for field in &["reasoning_content", "content"] {
+                    if let Some(text) = msg_delta[field].as_str() {
+                        if !text.is_empty() {
+                            let _ = tx
+                                .send(StreamChunk::Delta {
+                                    text: text.to_string(),
+                                })
+                                .await;
+                        }
                     }
                 }
 

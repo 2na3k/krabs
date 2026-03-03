@@ -41,7 +41,7 @@ pub struct AgentOutput {
 pub struct KrabsAgent {
     pub agent_id: String,
     pub config: KrabsConfig,
-    pub provider: Box<dyn LlmProvider>,
+    pub provider: Arc<dyn LlmProvider>,
     pub registry: ToolRegistry,
     pub memory: Box<dyn MemoryStore>,
     pub permissions: PermissionGuard,
@@ -61,7 +61,7 @@ pub struct KrabsAgent {
 pub struct KrabsAgentBuilder {
     agent_id: String,
     config: KrabsConfig,
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
     registry: ToolRegistry,
     memory: Box<dyn MemoryStore>,
     permissions: PermissionGuard,
@@ -70,6 +70,7 @@ pub struct KrabsAgentBuilder {
     hooks: HookRegistry,
     mcp_registry: Option<McpRegistry>,
     resume_mode: ResumeMode,
+    initial_session_id: Option<String>,
 }
 
 impl KrabsAgentBuilder {
@@ -77,7 +78,7 @@ impl KrabsAgentBuilder {
         Self {
             agent_id: uuid::Uuid::new_v4().to_string(),
             config,
-            provider: Box::new(provider),
+            provider: Arc::new(provider),
             registry: ToolRegistry::default(),
             memory: Box::new(crate::memory::memory::InMemoryStore::new()),
             permissions: PermissionGuard::new(),
@@ -86,7 +87,15 @@ impl KrabsAgentBuilder {
             hooks: HookRegistry::default(),
             mcp_registry: None,
             resume_mode: ResumeMode::New,
+            initial_session_id: None,
         }
+    }
+
+    /// Pre-assign the session ID for this (new) session.
+    /// The ID will be used when the session is created in `build_async`.
+    pub fn session_id(mut self, id: impl Into<String>) -> Self {
+        self.initial_session_id = Some(id.into());
+        self
     }
 
     /// Resume a previously persisted session rather than creating a new one.
@@ -186,7 +195,12 @@ impl KrabsAgentBuilder {
                 let result = match &self.resume_mode {
                     ResumeMode::New => {
                         store
-                            .new_session(&self.agent_id, &self.config.model, &provider_name)
+                            .new_session_with_id(
+                                &self.agent_id,
+                                &self.config.model,
+                                &provider_name,
+                                self.initial_session_id.clone(),
+                            )
                             .await
                     }
                     ResumeMode::Resume { session_id } => store.load_session(session_id).await,
@@ -309,7 +323,7 @@ impl KrabsAgent {
         Self {
             agent_id: uuid::Uuid::new_v4().to_string(),
             config,
-            provider: Box::new(provider),
+            provider: Arc::new(provider),
             registry,
             memory: Box::new(memory),
             permissions,
@@ -766,20 +780,30 @@ impl KrabsAgent {
                 messages.len()
             );
 
-            let (turn_tx, mut turn_rx) = mpsc::channel::<StreamChunk>(64);
-            let turn_tx_retry = turn_tx.clone();
-            self.call_with_retry(turn, "llm_stream", Some(&tx), || {
-                let msgs = messages.clone();
-                let defs = tool_defs.clone();
-                let tx = turn_tx_retry.clone();
-                async move { self.provider.stream_complete(&msgs, &defs, tx).await }
-            })
-            .await?;
-            // Drop both sender handles so turn_rx closes after all buffered chunks
-            // are consumed. Without this the while loop below blocks forever because
-            // at least one Sender is still alive.
+            // Bounded channel large enough for any realistic streaming response.
+            // Previously capacity 64 caused a deadlock: stream_complete was
+            // awaited synchronously inside call_with_retry while the consumer
+            // loop below only ran after call_with_retry returned.  Models with
+            // extended thinking (e.g. Qwen3) easily produce 64+ chunks, filling
+            // the buffer and blocking the producer while the consumer starved.
+            //
+            // Fix: spawn stream_complete as a concurrent task so producer and
+            // consumer run in parallel.
+            let (turn_tx, mut turn_rx) = mpsc::channel::<StreamChunk>(4096);
+
+            let provider_for_stream = Arc::clone(&self.provider);
+            let msgs_for_stream = messages.clone();
+            let defs_for_stream = tool_defs.clone();
+            let turn_tx_for_stream = turn_tx.clone();
+            let stream_task: tokio::task::JoinHandle<anyhow::Result<()>> =
+                tokio::task::spawn(async move {
+                    provider_for_stream
+                        .stream_complete(&msgs_for_stream, &defs_for_stream, turn_tx_for_stream)
+                        .await
+                });
+            // Drop the local sender so turn_rx closes once the spawned task's
+            // copy is also dropped (i.e. when stream_complete returns).
             drop(turn_tx);
-            drop(turn_tx_retry);
 
             let mut delta_content = String::new();
             let mut tool_calls_this_turn = Vec::new();
@@ -802,8 +826,23 @@ impl KrabsAgent {
                 ) && tx.send(chunk).await.is_err()
                 {
                     // Consumer dropped (Ctrl+C) — stop the loop.
+                    stream_task.abort();
                     return Ok(messages);
                 }
+            }
+
+            // Propagate any error from the streaming task.
+            match stream_task.await {
+                Ok(Err(e)) => {
+                    self.persist_error(turn, "llm_stream", &e, 0).await;
+                    return Err(e);
+                }
+                Err(join_err) if !join_err.is_cancelled() => {
+                    let e = anyhow::anyhow!("stream task panicked: {join_err}");
+                    self.persist_error(turn, "llm_stream", &e, 0).await;
+                    return Err(e);
+                }
+                _ => {}
             }
 
             if let Some(usage) = usage_this_turn {
@@ -893,11 +932,16 @@ impl KrabsAgent {
                                     })
                                     .await
                             };
-                            let content = if let HookOutput::AppendContext(ctx) = post {
+                            let mut content = if let HookOutput::AppendContext(ctx) = post {
                                 format!("{}\n{}", result.content, ctx)
                             } else {
                                 result.content
                             };
+                            let max_chars = self.config.max_tool_result_chars;
+                            if max_chars > 0 && content.len() > max_chars {
+                                content.truncate(max_chars);
+                                content.push_str("\n\n[…output truncated to fit context window…]");
+                            }
                             let result_msg = Message::tool_result(&content, &call.id, &call.name);
                             self.persist_message(&result_msg, turn).await;
                             messages.push(result_msg);

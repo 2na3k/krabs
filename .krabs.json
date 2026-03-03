@@ -2,5 +2,21 @@
   "provider": "openai",
   "model": "Qwen3-4B-Q8_0.gguf",
   "base_url": "http://127.0.0.1:8080/v1",
-  "api_key": ""
+  "api_key": "",
+  "custom_models": [
+    {
+      "name": "qwen3-4b",
+      "provider": "openai",
+      "model": "Qwen3-4B-Q8_0.gguf",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "api_key": ""
+    },
+    {
+      "name": "qwen3-9b",
+      "provider": "openai",
+      "model": "Qwen3.5-9B-Q4_K_M.gguf",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "api_key": ""
+    }
+  ]
 }

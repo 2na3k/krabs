@@ -152,7 +152,18 @@ impl SessionStore {
         model: &str,
         provider: &str,
     ) -> Result<Arc<Session>> {
-        let id = Uuid::new_v4().to_string();
+        self.new_session_with_id(agent_id, model, provider, None)
+            .await
+    }
+
+    pub async fn new_session_with_id(
+        &self,
+        agent_id: &str,
+        model: &str,
+        provider: &str,
+        id: Option<String>,
+    ) -> Result<Arc<Session>> {
+        let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
         sqlx::query(
             "INSERT INTO sessions (id, agent_id, model, provider, created_at) VALUES (?, ?, ?, ?, ?)",
         )

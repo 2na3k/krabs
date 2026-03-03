@@ -62,6 +62,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
         model: creds.model.clone(),
         cwd,
         tools: registry.names().join(", "),
+        session_id: None,
     };
 
     // Terminal setup — install a panic hook so we always restore the terminal
@@ -101,7 +102,10 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
     let mut messages: Vec<Message> = Vec::new();
 
     // If resuming, reconstruct history from the persisted session.
+    // Otherwise generate a fresh session ID upfront so it shows in the info bar
+    // before the first message is sent.
     let mut active_resume_id: Option<String> = None;
+    let mut pending_session_id: Option<String> = None;
     if let Some(ref sid) = resume_id {
         let (history, display_msgs) = load_resume_history(&krabs_config, sid).await;
         if !history.is_empty() {
@@ -110,8 +114,13 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
             }
             messages = history;
             active_resume_id = Some(sid.clone());
+            info.session_id = Some(sid.clone());
             app.push(ChatMsg::Info(format!("Resumed session {sid}")));
         }
+    } else {
+        let new_id = krabs_core::new_session_id();
+        info.session_id = Some(new_id.clone());
+        pending_session_id = Some(new_id);
     }
 
     let perm: SharedPerm = Arc::new(Mutex::new(None));
@@ -178,6 +187,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         stream_rx = None;
                         turn_handle = None;
                         if session_id.is_some() {
+                            info.session_id = session_id.clone();
                             active_resume_id = session_id;
                         }
                         if let Some(queued) = app.queued_input.take() {
@@ -195,6 +205,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 tx.clone(),
                                 Arc::clone(&perm),
                                 active_resume_id.take(),
+                                None,
                             )
                             .await;
                             turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
@@ -206,6 +217,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         turn_handle = None;
                         app.push(ChatMsg::Error(message));
                         if session_id.is_some() {
+                            info.session_id = session_id.clone();
                             active_resume_id = session_id;
                         }
                         if let Some(queued) = app.queued_input.take() {
@@ -223,6 +235,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 tx.clone(),
                                 Arc::clone(&perm),
                                 active_resume_id.take(),
+                                None,
                             )
                             .await;
                             turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
@@ -780,6 +793,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                     tx.clone(),
                                     Arc::clone(&perm),
                                     active_resume_id.take(),
+                                    pending_session_id.take(),
                                 )
                                 .await;
                                 turn_handle = Some(tokio::spawn(run_agent_turn(
