@@ -270,6 +270,12 @@ System messages **are persisted** alongside other roles. On resume, the full con
 - Each retry emits a `StreamChunk::Status` via `status_tx` (streaming path) so the CLI shows retry progress
 - Failures are `warn!`, not `error!` — after exhausting retries the `Err` propagates and the agent loop decides whether to abort
 
+> **Streaming path note:** For the streaming loop, `stream_complete` is **not** wrapped in
+> `call_with_retry`. It is spawned as a concurrent `tokio::task` so the producer and
+> chunk-consumer run in parallel. If the task returns an error, it is persisted via
+> `persist_error` and the loop returns `Err`. `call_with_retry` is still used for the
+> non-streaming (`run` / `complete`) path.
+
 ---
 
 ### Tool Retry with Persistence
@@ -281,6 +287,42 @@ System messages **are persisted** alongside other roles. On resume, the full con
 - Hard errors are persisted via `persist_error`; soft errors are not (they're a tool-level concern)
 - Each retry emits a `StreamChunk::Status` to the CLI
 - After exhausting retries, returns the final `ToolResult` to the LLM; `PostToolUse` fires for all outcomes
+
+---
+
+### Tool Result Truncation
+
+`config.max_tool_result_chars` (default: **8000 chars**):
+- Applied in `streaming_loop_inner` after the tool call and hook post-processing
+- If the result exceeds the limit, it is truncated and `\n\n[…output truncated to fit context window…]` is appended
+- Set to `0` to disable truncation entirely
+- Prevents context-overflow errors when tools return large outputs (e.g. `web_fetch` returning full HTML pages)
+
+---
+
+### Streaming Concurrency Model
+
+`streaming_loop_inner` uses a **concurrent producer/consumer** pattern per turn:
+
+```
+tokio::spawn(stream_complete → turn_tx)   ← producer
+while turn_rx.recv() { ... }              ← consumer (runs in parallel)
+stream_task.await                         ← join; propagate errors
+```
+
+The inner channel (`mpsc::channel(4096)`) buffers chunks between producer and consumer. The large capacity prevents backpressure stalls for models with extended thinking (e.g. Qwen3), while the concurrent spawn prevents the deadlock that would occur if the producer were awaited synchronously before the consumer started.
+
+The provider field on `KrabsAgent` is `Arc<dyn LlmProvider>` so it can be cheaply cloned into the spawned task without moving out of `self`.
+
+---
+
+### OpenAI Streaming — `reasoning_content` Support
+
+`crates/krabs-core/src/providers/openai.rs` captures both `content` and `reasoning_content`
+delta fields from each SSE chunk. Some OpenAI-compatible endpoints (e.g. Qwen3 with extended
+thinking via llama.cpp) emit chain-of-thought tokens in `reasoning_content` rather than
+`content`. Both are forwarded as `StreamChunk::Delta` so they appear in the TUI and are
+included in the persisted assistant message.
 
 ---
 
@@ -301,6 +343,8 @@ Queued message dispatched → build_agent(..., active_resume_id.take())
 
 This ensures that a message typed while the agent is thinking, and dispatched after the current turn completes (or errors), is recorded in the same session rather than creating a new one.
 
+**Pre-assigned session ID:** At CLI startup (new session path), a UUID is generated immediately via `krabs_core::new_session_id()` and shown in the info bar before the first message is sent. It is passed to `KrabsAgentBuilder::session_id()` so the DB session record uses the same UUID the user already sees.
+
 ---
 
 ### CLI Resume
@@ -313,7 +357,29 @@ Parsed in `crates/krabs-cli/src/main.rs`; passed as `ResumeMode::Resume { sessio
 
 ---
 
-## 3. Architectural Decisions
+## 3. Config Reference
+
+All fields are in `KrabsConfig` (`crates/krabs-core/src/config/config.rs`). Loaded from
+`~/.krabs/config.json`, with per-project overrides from `.krabs.json` (shallow merge).
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `max_turns` | usize | 50 | Hard cap on agent loop iterations |
+| `max_retries` | usize | 3 | LLM retry attempts (4 total) |
+| `retry_base_delay_ms` | u64 | 500 | Exponential backoff base |
+| `tool_max_retries` | usize | 1 | Tool retry attempts (2 total) |
+| `max_context_tokens` | usize | 128000 | Context trim threshold |
+| `max_tool_result_chars` | usize | 8000 | Tool output truncation limit (0 = off) |
+| `db_path` | PathBuf | `~/.krabs/krabs.db` | SQLite database location |
+| `auto_approve_tools` | Vec\<String\> | [] | Tools that skip the permission popup |
+| `telemetry` | TelemetryConfig | disabled | Raw event export |
+| `langfuse` | LangfuseConfig | disabled | Structured trace export |
+| `router` | RouterConfig | reactive | Task routing strategy |
+| `sandbox` | SandboxConfig | disabled | Capability restrictions |
+
+---
+
+## 4. Architectural Decisions
 
 | Decision | Rationale |
 |---|---|
@@ -325,10 +391,13 @@ Parsed in `crates/krabs-cli/src/main.rs`; passed as `ResumeMode::Resume { sessio
 | `status_tx` in retry helpers | Retry visibility in CLI without requiring a log subscriber |
 | `PostToolUseFailure` on error, `PostToolUse` on success | Clean hook surface; hooks don't need to inspect `is_error` |
 | `Result<T>` everywhere, no `unwrap` | Correctness by construction (CLAUDE.md law) |
+| `Arc<dyn LlmProvider>` (not `Box`) | Allows cheap clone into spawned stream task without moving out of `self` |
+| Concurrent stream producer/consumer | Prevents deadlock with extended-thinking models that emit 64+ chunks |
+| `reasoning_content` + `content` capture | Full visibility into Qwen3-style thinking tokens in the TUI |
 
 ---
 
-## 4. Key Files
+## 5. Key Files
 
 | File | Role |
 |---|---|
@@ -338,9 +407,10 @@ Parsed in `crates/krabs-cli/src/main.rs`; passed as `ResumeMode::Resume { sessio
 | `crates/krabs-core/src/hooks/registry.rs` | Hook dispatch & resolution |
 | `crates/krabs-core/src/hooks/telemetry.rs` | Raw event export (HTTP / JSONL / channel) |
 | `crates/krabs-core/src/hooks/langfuse.rs` | Langfuse trace/span mapping |
-| `crates/krabs-core/src/config/config.rs` | DB path, retry, telemetry, and langfuse config |
+| `crates/krabs-core/src/config/config.rs` | DB path, retry, telemetry, langfuse, tool truncation config |
 | `crates/krabs-core/examples/langfuse_trace.rs` | Langfuse smoke-test example |
 | `docker-compose.yml` | Local Langfuse v3 stack |
 | `crates/krabs-core/src/providers/provider.rs` | `StreamChunk::Status` for retry visibility |
+| `crates/krabs-core/src/providers/openai.rs` | SSE streaming + `reasoning_content` capture |
 | `crates/krabs-cli/src/main.rs` | `--resume` CLI flag |
 | `crates/krabs-cli/src/chat/agent.rs` | Session ID threading through `DisplayEvent` |
