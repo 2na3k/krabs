@@ -193,6 +193,18 @@ impl LangfuseHookBuilder {
         }
     }
 
+    /// Build from the `[langfuse]` section of `KrabsConfig`.
+    ///
+    /// Returns `None` if `enabled` is false or either key is empty.
+    pub fn from_config(cfg: &crate::LangfuseConfig) -> Option<Self> {
+        if !cfg.enabled || cfg.public_key.is_empty() || cfg.secret_key.is_empty() {
+            return None;
+        }
+        Some(
+            Self::new(&cfg.public_key, &cfg.secret_key).base_url(&cfg.base_url),
+        )
+    }
+
     /// Override the Langfuse base URL. Defaults to `http://localhost:3000`.
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
@@ -431,6 +443,7 @@ impl Hook for LangfuseHook {
 mod tests {
     use super::*;
 
+
     #[test]
     fn now_iso_looks_like_iso8601() {
         let s = now_iso();
@@ -461,6 +474,42 @@ mod tests {
         assert_eq!(hook.base_url, "http://localhost:3000");
         assert!(hook.session_id.is_none());
         assert!(hook.agent_id.is_none());
+    }
+
+    #[test]
+    fn from_config_returns_none_when_disabled() {
+        let cfg = crate::LangfuseConfig {
+            enabled: false,
+            public_key: "pk".into(),
+            secret_key: "sk".into(),
+            base_url: "http://localhost:3000".into(),
+        };
+        assert!(LangfuseHookBuilder::from_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn from_config_returns_none_when_keys_empty() {
+        let cfg = crate::LangfuseConfig {
+            enabled: true,
+            public_key: String::new(),
+            secret_key: String::new(),
+            base_url: "http://localhost:3000".into(),
+        };
+        assert!(LangfuseHookBuilder::from_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn from_config_builds_correctly() {
+        let cfg = crate::LangfuseConfig {
+            enabled: true,
+            public_key: "pk-lf-test".into(),
+            secret_key: "sk-lf-test".into(),
+            base_url: "http://self-hosted:3000".into(),
+        };
+        let hook = LangfuseHookBuilder::from_config(&cfg).unwrap().build();
+        assert_eq!(hook.public_key, "pk-lf-test");
+        assert_eq!(hook.secret_key, "sk-lf-test");
+        assert_eq!(hook.base_url, "http://self-hosted:3000");
     }
 
     #[test]
