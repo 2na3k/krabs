@@ -1,0 +1,33 @@
+[package]
+name = "krabs-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "krabs_mcp"
+path = "src/lib.rs"
+
+[[example]]
+name = "stdio_server"
+path = "examples/stdio_server.rs"
+
+[[example]]
+name = "sse_server"
+path = "examples/sse_server.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+futures-util = "=0.3.31"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
