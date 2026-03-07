@@ -1,16 +1,22 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
-use std::sync::LazyLock;
+use tokio::sync::OnceCell;
 
 use crate::tools::tool::{McpContent, McpServerTool, McpToolResult};
 
-static CLIENT: LazyLock<Client> = LazyLock::new(|| {
-    Client::builder()
-        .user_agent("krabs-mcp/0.1")
-        .build()
-        .expect("failed to build reqwest client")
-});
+static CLIENT: OnceCell<Client> = OnceCell::const_new();
+
+async fn client() -> &'static Client {
+    CLIENT
+        .get_or_init(|| async {
+            Client::builder()
+                .user_agent("krabs-mcp/0.1")
+                .build()
+                .expect("failed to build reqwest client")
+        })
+        .await
+}
 
 pub struct WebSearchTool;
 
@@ -42,7 +48,7 @@ impl McpServerTool for WebSearchTool {
     }
 
     async fn call(&self, args: serde_json::Value) -> anyhow::Result<McpToolResult> {
-        search_with_client(&CLIENT, args).await
+        search_with_client(client().await, args).await
     }
 }
 

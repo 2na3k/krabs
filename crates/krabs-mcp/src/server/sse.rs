@@ -38,8 +38,12 @@ impl NotificationBroadcaster {
         let Ok(msg) = serde_json::to_string(notification) else {
             return;
         };
-        let sessions = self.sessions.lock().await;
-        for tx in sessions.values() {
+        // Snapshot senders under the lock, then release before awaiting sends.
+        // Holding the lock across async sends would block new connections and
+        // cleanup tasks if any channel is at capacity.
+        let senders: Vec<mpsc::Sender<String>> =
+            self.sessions.lock().await.values().cloned().collect();
+        for tx in senders {
             tx.send(msg.clone()).await.ok();
         }
     }
@@ -49,7 +53,9 @@ impl NotificationBroadcaster {
         let Ok(msg) = serde_json::to_string(notification) else {
             return;
         };
-        if let Some(tx) = self.sessions.lock().await.get(&session_id) {
+        // Clone the sender out of the lock before awaiting the send.
+        let tx = self.sessions.lock().await.get(&session_id).cloned();
+        if let Some(tx) = tx {
             tx.send(msg).await.ok();
         }
     }
