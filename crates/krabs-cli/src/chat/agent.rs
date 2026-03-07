@@ -147,10 +147,14 @@ pub(super) async fn build_agent(
 pub(super) async fn run_agent_turn(
     agent: Arc<krabs_core::KrabsAgent>,
     messages: Vec<Message>,
+    subturn_resume: Option<krabs_core::SubturnResume>,
     tx: mpsc::Sender<DisplayEvent>,
 ) {
     let session_id = agent.session_id().map(|s| s.to_string());
-    let (mut stream, done_rx) = match agent.run_streaming_with_history(messages).await {
+    let (mut stream, done_rx) = match agent
+        .run_streaming_with_history(messages, subturn_resume)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let _ = tx

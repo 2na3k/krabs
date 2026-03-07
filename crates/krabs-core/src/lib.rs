@@ -34,7 +34,9 @@ pub use router::{parse_decision, FixedRouter, RouteDecision, RulesRouter, TaskRo
 pub use sandbox::{SandboxConfig, SandboxProxy, SandboxedTool};
 
 pub use providers::{AnthropicProvider, GeminiProvider, OpenAiProvider};
-pub use session::session::{Session, SessionStore, StoredCheckpoint, StoredError, StoredMessage};
+pub use session::session::{
+    ResumeState, Session, SessionStore, StoredCheckpoint, StoredError, StoredMessage, SubturnResume,
+};
 pub use skills::{FsSkill, SkillRegistry};
 pub use tools::bash::BashTool;
 pub use tools::delegate::DelegateTool;

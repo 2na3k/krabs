@@ -63,12 +63,14 @@ CREATE TABLE IF NOT EXISTS errors (
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT    NOT NULL REFERENCES sessions(id),
-    agent_id    TEXT    NOT NULL,
-    turn        INTEGER NOT NULL,
-    last_msg_id INTEGER NOT NULL,
-    created_at  INTEGER NOT NULL
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id         TEXT    NOT NULL REFERENCES sessions(id),
+    agent_id           TEXT    NOT NULL,
+    turn               INTEGER NOT NULL,
+    last_msg_id        INTEGER NOT NULL,
+    subturn_tool_idx   INTEGER,
+    subturn_call_id    TEXT,
+    created_at         INTEGER NOT NULL
 );
 "#;
 
@@ -120,7 +122,40 @@ pub struct StoredCheckpoint {
     pub turn: usize,
     /// The highest `messages.id` included in this checkpoint.
     pub last_msg_id: i64,
+    /// Set for sub-turn checkpoints: 0-indexed position of the last completed tool call.
+    /// `None` means this is a full-turn checkpoint.
+    pub subturn_tool_idx: Option<usize>,
+    /// The `tool_call_id` of the last completed tool call (sub-turn checkpoints only).
+    pub subturn_call_id: Option<String>,
     pub created_at: i64,
+}
+
+// ── Resume helpers ────────────────────────────────────────────────────────────
+
+/// Metadata about an in-progress (sub-turn) resume.
+///
+/// When a session is resumed from a sub-turn checkpoint, this carries the
+/// information the agent loop needs to skip re-executing tool calls that
+/// already completed before the crash.
+#[derive(Debug, Clone)]
+pub struct SubturnResume {
+    /// The turn index that was interrupted.
+    pub turn: usize,
+    /// How many tool calls in that turn already have persisted results
+    /// (`tool_idx + 1` where `tool_idx` is the last completed index).
+    pub completed_tool_count: usize,
+    /// The `tool_call_id` of the last completed tool call.
+    pub last_call_id: String,
+}
+
+/// Returned by `KrabsAgent::load_history_from_session`.
+#[derive(Debug)]
+pub struct ResumeState {
+    /// Reconstructed conversation history (system messages excluded — they are
+    /// rebuilt each turn).
+    pub messages: Vec<crate::providers::provider::Message>,
+    /// Present only when resuming from a sub-turn checkpoint.
+    pub subturn_resume: Option<SubturnResume>,
 }
 
 // ── SessionStore ──────────────────────────────────────────────────────────────
@@ -137,10 +172,15 @@ impl SessionStore {
         let url = format!("sqlite://{}?mode=rwc", db_path.display());
         let pool = SqlitePool::connect(&url).await?;
         sqlx::query(MIGRATE).execute(&pool).await?;
-        // Best-effort migration for existing DBs that pre-date the `attempt`
-        // column and `checkpoints` table. SQLite returns an error if the column
-        // already exists; we swallow it.
+        // Best-effort migrations for existing DBs that pre-date certain columns.
+        // SQLite returns an error if the column already exists; we swallow it.
         let _ = sqlx::query("ALTER TABLE errors ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE checkpoints ADD COLUMN subturn_tool_idx INTEGER")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE checkpoints ADD COLUMN subturn_call_id TEXT")
             .execute(&pool)
             .await;
         Ok(Self { pool })
@@ -296,7 +336,7 @@ impl Session {
 
     // ── Checkpointing ─────────────────────────────────────────────────────────
 
-    /// Write a checkpoint after a fully-completed turn.
+    /// Write a full-turn checkpoint after a completely-finished turn.
     ///
     /// A checkpoint captures the highest `messages.id` at this moment, meaning
     /// all messages written up to this point are considered consistent and safe
@@ -311,8 +351,9 @@ impl Session {
         let last_msg_id: i64 = row.try_get("max_id")?;
 
         sqlx::query(
-            "INSERT INTO checkpoints (session_id, agent_id, turn, last_msg_id, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO checkpoints \
+             (session_id, agent_id, turn, last_msg_id, subturn_tool_idx, subturn_call_id, created_at) \
+             VALUES (?, ?, ?, ?, NULL, NULL, ?)",
         )
         .bind(&self.id)
         .bind(&self.agent_id)
@@ -325,10 +366,48 @@ impl Session {
         Ok(())
     }
 
+    /// Write a sub-turn checkpoint after a single tool call's result has been persisted.
+    ///
+    /// `tool_idx` is the 0-indexed position of the completed tool call within the current turn.
+    /// `call_id` is the `tool_call_id` of that call, used to identify already-completed calls
+    /// when the session is resumed mid-turn.
+    pub async fn write_subturn_checkpoint(
+        &self,
+        turn: usize,
+        tool_idx: usize,
+        call_id: &str,
+    ) -> Result<()> {
+        let row =
+            sqlx::query("SELECT COALESCE(MAX(id), 0) as max_id FROM messages WHERE session_id = ?")
+                .bind(&self.id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        let last_msg_id: i64 = row.try_get("max_id")?;
+
+        sqlx::query(
+            "INSERT INTO checkpoints \
+             (session_id, agent_id, turn, last_msg_id, subturn_tool_idx, subturn_call_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&self.id)
+        .bind(&self.agent_id)
+        .bind(turn as i64)
+        .bind(last_msg_id)
+        .bind(tool_idx as i64)
+        .bind(call_id)
+        .bind(now_ts())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Load the most recent checkpoint for this session.
     pub async fn latest_checkpoint(&self) -> Result<Option<StoredCheckpoint>> {
         let row = sqlx::query(
-            "SELECT id, session_id, agent_id, turn, last_msg_id, created_at \
+            "SELECT id, session_id, agent_id, turn, last_msg_id, \
+                    subturn_tool_idx, subturn_call_id, created_at \
              FROM checkpoints WHERE session_id = ? ORDER BY id DESC LIMIT 1",
         )
         .bind(&self.id)
@@ -342,6 +421,10 @@ impl Session {
                 agent_id: r.try_get("agent_id")?,
                 turn: r.try_get::<i64, _>("turn")? as usize,
                 last_msg_id: r.try_get("last_msg_id")?,
+                subturn_tool_idx: r
+                    .try_get::<Option<i64>, _>("subturn_tool_idx")?
+                    .map(|v| v as usize),
+                subturn_call_id: r.try_get("subturn_call_id")?,
                 created_at: r.try_get("created_at")?,
             })
         })
@@ -805,6 +888,241 @@ mod tests {
 
         assert_eq!(session.search("Rust").await.unwrap().len(), 2);
         assert_eq!(session.search("Python").await.unwrap().len(), 1);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ── Sub-turn checkpoint tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn subturn_checkpoint_written_and_loaded() {
+        let (store, path) = open_temp_store().await;
+        let session = store
+            .new_session("agent-1", "gpt-4o", "openai")
+            .await
+            .unwrap();
+
+        let call0 = ToolCall {
+            id: "call_000".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let call1 = ToolCall {
+            id: "call_001".to_string(),
+            name: "read".to_string(),
+            args: serde_json::json!({}),
+            thought_signature: None,
+        };
+
+        session
+            .persist_message(&Message::user("do things"), 0)
+            .await
+            .unwrap();
+        session
+            .persist_message(
+                &Message::assistant_tool_calls(vec![call0.clone(), call1.clone()]),
+                0,
+            )
+            .await
+            .unwrap();
+
+        // tool[0] completes — write sub-turn checkpoint at idx=0
+        session
+            .persist_message(&Message::tool_result("ok0", &call0.id, &call0.name), 0)
+            .await
+            .unwrap();
+        session
+            .write_subturn_checkpoint(0, 0, &call0.id)
+            .await
+            .unwrap();
+
+        let cp = session
+            .latest_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint exists");
+        assert_eq!(cp.turn, 0);
+        assert_eq!(cp.subturn_tool_idx, Some(0));
+        assert_eq!(cp.subturn_call_id.as_deref(), Some("call_000"));
+
+        // tool[1] completes — write sub-turn checkpoint at idx=1
+        session
+            .persist_message(&Message::tool_result("ok1", &call1.id, &call1.name), 0)
+            .await
+            .unwrap();
+        session
+            .write_subturn_checkpoint(0, 1, &call1.id)
+            .await
+            .unwrap();
+
+        let cp2 = session
+            .latest_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint exists");
+        assert_eq!(cp2.subturn_tool_idx, Some(1));
+        assert_eq!(cp2.subturn_call_id.as_deref(), Some("call_001"));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn full_turn_checkpoint_has_null_subturn_fields() {
+        let (store, path) = open_temp_store().await;
+        let session = store
+            .new_session("agent-1", "gpt-4o", "openai")
+            .await
+            .unwrap();
+
+        session
+            .persist_message(&Message::user("hi"), 0)
+            .await
+            .unwrap();
+        session
+            .persist_message(&Message::assistant("hello"), 0)
+            .await
+            .unwrap();
+        session.write_checkpoint(0).await.unwrap();
+
+        let cp = session
+            .latest_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint exists");
+        assert_eq!(cp.subturn_tool_idx, None);
+        assert_eq!(cp.subturn_call_id, None);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn subturn_rollback_removes_only_partial() {
+        let (store, path) = open_temp_store().await;
+        let session = store
+            .new_session("agent-1", "gpt-4o", "openai")
+            .await
+            .unwrap();
+
+        let call0 = ToolCall {
+            id: "call_000".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let call1 = ToolCall {
+            id: "call_001".to_string(),
+            name: "read".to_string(),
+            args: serde_json::json!({}),
+            thought_signature: None,
+        };
+
+        session
+            .persist_message(&Message::user("do things"), 0)
+            .await
+            .unwrap();
+        session
+            .persist_message(
+                &Message::assistant_tool_calls(vec![call0.clone(), call1.clone()]),
+                0,
+            )
+            .await
+            .unwrap();
+
+        // tool[0] completes successfully
+        session
+            .persist_message(&Message::tool_result("ok0", &call0.id, &call0.name), 0)
+            .await
+            .unwrap();
+        session
+            .write_subturn_checkpoint(0, 0, &call0.id)
+            .await
+            .unwrap();
+
+        let cp = session
+            .latest_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint exists");
+        let safe_msg_id = cp.last_msg_id;
+
+        // tool[1] starts executing but crashes before completing (partial row written)
+        session
+            .persist_message(&Message::tool_result("partial", &call1.id, &call1.name), 0)
+            .await
+            .unwrap();
+
+        // Before rollback: user + assistant_tool_calls + tool[0] result + partial tool[1] = 4
+        assert_eq!(session.messages().await.unwrap().len(), 4);
+
+        // Rollback to the subturn checkpoint boundary
+        session.rollback_to(safe_msg_id).await.unwrap();
+
+        // After rollback: user + assistant_tool_calls + tool[0] result = 3 (partial gone)
+        let after = session.messages().await.unwrap();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[2].role, "tool");
+        assert_eq!(after[2].tool_name.as_deref(), Some("bash"));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn subturn_checkpoint_latest_returns_most_recent() {
+        // When a full-turn checkpoint is followed by sub-turn checkpoints in the
+        // NEXT turn, latest_checkpoint returns the sub-turn one.
+        let (store, path) = open_temp_store().await;
+        let session = store
+            .new_session("agent-1", "gpt-4o", "openai")
+            .await
+            .unwrap();
+
+        // Turn 0 completes fully
+        session
+            .persist_message(&Message::user("step one"), 0)
+            .await
+            .unwrap();
+        session
+            .persist_message(&Message::assistant("done"), 0)
+            .await
+            .unwrap();
+        session.write_checkpoint(0).await.unwrap();
+
+        // Turn 1 starts, tool[0] completes, then crash
+        let call = ToolCall {
+            id: "call_t1_0".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({}),
+            thought_signature: None,
+        };
+        session
+            .persist_message(&Message::user("step two"), 1)
+            .await
+            .unwrap();
+        session
+            .persist_message(&Message::assistant_tool_calls(vec![call.clone()]), 1)
+            .await
+            .unwrap();
+        session
+            .persist_message(&Message::tool_result("ok", &call.id, &call.name), 1)
+            .await
+            .unwrap();
+        session
+            .write_subturn_checkpoint(1, 0, &call.id)
+            .await
+            .unwrap();
+
+        let cp = session
+            .latest_checkpoint()
+            .await
+            .unwrap()
+            .expect("checkpoint");
+        assert_eq!(cp.turn, 1);
+        assert_eq!(cp.subturn_tool_idx, Some(0));
 
         drop(store);
         let _ = std::fs::remove_file(path);

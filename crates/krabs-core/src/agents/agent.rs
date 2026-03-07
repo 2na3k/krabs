@@ -6,10 +6,12 @@ use crate::hooks::telemetry::{TelemetryHook, TelemetryHookBuilder};
 use crate::mcp::mcp::McpRegistry;
 use crate::memory::MemoryStore;
 use crate::permissions::PermissionGuard;
-use crate::providers::provider::{LlmProvider, LlmResponse, Message, Role, StreamChunk};
+use crate::providers::provider::{
+    LlmProvider, LlmResponse, Message, Role, StreamChunk, TokenUsage, ToolCall,
+};
 use crate::router::{RouteDecision, RulesRouter, TaskRouter};
 use crate::sandbox::{SandboxProxy, SandboxedTool};
-use crate::session::session::{Session, SessionStore};
+use crate::session::session::{ResumeState, Session, SessionStore, SubturnResume};
 use crate::skills::registry::SkillRegistry;
 use crate::tools::read_skill::ReadSkillTool;
 use crate::tools::registry::ToolRegistry;
@@ -446,25 +448,43 @@ impl KrabsAgent {
     /// - If a checkpoint exists, incomplete messages after the checkpoint boundary
     ///   are rolled back before loading.
     /// - If no checkpoint exists, all messages are loaded (best-effort).
-    /// - Returns an empty `Vec` if no session is active.
-    pub async fn load_history_from_session(&self) -> Result<Vec<Message>> {
+    /// - Returns an empty `ResumeState` (no messages, no subturn) if no session is active.
+    /// - When the latest checkpoint is a sub-turn checkpoint, `subturn_resume` is populated
+    ///   so the agent loop can skip re-executing already-completed tool calls.
+    pub async fn load_history_from_session(&self) -> Result<ResumeState> {
         let session = match &self.session {
             Some(s) => s,
-            None => return Ok(Vec::new()),
+            None => {
+                return Ok(ResumeState {
+                    messages: Vec::new(),
+                    subturn_resume: None,
+                })
+            }
         };
 
-        let stored = match session.latest_checkpoint().await? {
+        let (stored, subturn_resume) = match session.latest_checkpoint().await? {
             Some(cp) => {
                 session.rollback_to(cp.last_msg_id).await?;
-                session.messages_up_to(cp.last_msg_id).await?
+                let msgs = session.messages_up_to(cp.last_msg_id).await?;
+                let subturn = cp.subturn_tool_idx.map(|idx| SubturnResume {
+                    turn: cp.turn,
+                    completed_tool_count: idx + 1,
+                    last_call_id: cp.subturn_call_id.unwrap_or_default(),
+                });
+                (msgs, subturn)
             }
-            None => session.messages().await?,
+            None => (session.messages().await?, None),
         };
 
-        stored
+        let messages = stored
             .iter()
-            .map(crate::session::session::Session::stored_to_message)
-            .collect()
+            .map(Session::stored_to_message)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(ResumeState {
+            messages,
+            subturn_resume,
+        })
     }
 
     /// Retry an async operation with exponential backoff, persisting each
@@ -578,6 +598,14 @@ impl KrabsAgent {
         }
     }
 
+    async fn write_subturn_checkpoint(&self, turn: usize, tool_idx: usize, call_id: &str) {
+        if let Some(s) = &self.session {
+            if let Err(e) = s.write_subturn_checkpoint(turn, tool_idx, call_id).await {
+                warn!("Failed to write sub-turn checkpoint: {e}");
+            }
+        }
+    }
+
     /// Fire-and-log helper so persist errors never abort the agent loop.
     async fn persist_message(&self, msg: &Message, turn: usize) {
         if let Some(s) = &self.session {
@@ -624,6 +652,116 @@ impl KrabsAgent {
         total / self.config.max_context_tokens as f32
     }
 
+    /// Streaming LLM call with exponential-backoff retry.
+    ///
+    /// Returns `Ok(Some((delta, calls, usage)))` on success.
+    /// Returns `Ok(None)` when the CLI consumer dropped (Ctrl+C) — caller should stop cleanly.
+    /// Returns `Err` after exhausting all retry attempts.
+    async fn stream_with_retry(
+        &self,
+        turn: usize,
+        messages: &[Message],
+        tool_defs: &[crate::tools::tool::ToolDef],
+        tx: &mpsc::Sender<StreamChunk>,
+    ) -> Result<Option<(String, Vec<ToolCall>, Option<TokenUsage>)>> {
+        let max = self.config.max_retries;
+        let base_ms = self.config.retry_base_delay_ms;
+        let mut attempt_result = None;
+        for attempt in 0..=max {
+            match self.stream_one_attempt(messages, tool_defs, tx).await {
+                Ok(Some(v)) => {
+                    attempt_result = Some(v);
+                    break;
+                }
+                Ok(None) => return Ok(None), // cancelled
+                Err(e) => {
+                    self.persist_error(turn, "llm_stream", &e, attempt).await;
+                    if attempt < max {
+                        let delay = base_ms * 2u64.pow(attempt as u32);
+                        let msg = format!(
+                            "↻ LLM stream attempt {}/{} failed: {e} — retrying in {delay}ms…",
+                            attempt + 1,
+                            max + 1,
+                        );
+                        warn!("{msg}");
+                        let _ = tx.send(StreamChunk::Status { text: msg }).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(Some(attempt_result.expect("loop exited without result or error")))
+    }
+
+    /// Perform a single streaming LLM call for one turn.
+    ///
+    /// Spawns `stream_complete` as a concurrent task (producer) and drains the
+    /// channel (consumer) in parallel to avoid deadlocks with extended-thinking
+    /// models that emit many chunks.
+    ///
+    /// Chunks that are safe to forward to the outer `tx` (`Delta` and
+    /// `ToolCallReady`) are forwarded immediately. If `tx` is closed (Ctrl+C),
+    /// the producer task is aborted and `Ok(None)` is returned to signal
+    /// cancellation.
+    ///
+    /// Returns `Ok(Some((delta, tool_calls, usage)))` on success.
+    /// Returns `Ok(None)` when the outer consumer (CLI) has dropped `tx`.
+    /// Returns `Err` on any LLM/stream error — the caller decides whether to retry.
+    async fn stream_one_attempt(
+        &self,
+        messages: &[Message],
+        tool_defs: &[crate::tools::tool::ToolDef],
+        tx: &mpsc::Sender<StreamChunk>,
+    ) -> Result<Option<(String, Vec<ToolCall>, Option<TokenUsage>)>> {
+        let (turn_tx, mut turn_rx) = mpsc::channel::<StreamChunk>(4096);
+
+        let provider_for_stream = Arc::clone(&self.provider);
+        let msgs_for_stream = messages.to_vec();
+        let defs_for_stream = tool_defs.to_vec();
+        let turn_tx_for_stream = turn_tx.clone();
+        let stream_task: tokio::task::JoinHandle<anyhow::Result<()>> =
+            tokio::task::spawn(async move {
+                provider_for_stream
+                    .stream_complete(&msgs_for_stream, &defs_for_stream, turn_tx_for_stream)
+                    .await
+            });
+        drop(turn_tx);
+
+        let mut delta_content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = None;
+
+        while let Some(chunk) = turn_rx.recv().await {
+            match &chunk {
+                StreamChunk::Delta { text } => delta_content.push_str(text),
+                StreamChunk::ToolCallReady { call } => tool_calls.push(call.clone()),
+                StreamChunk::Done { usage: u } => usage = Some(u.clone()),
+                StreamChunk::Status { .. } => {}
+            }
+            if matches!(
+                chunk,
+                StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. }
+            ) && tx.send(chunk).await.is_err()
+            {
+                stream_task.abort();
+                return Ok(None); // consumer dropped (Ctrl+C)
+            }
+        }
+
+        match stream_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) if !join_err.is_cancelled() => {
+                return Err(anyhow::anyhow!("stream task panicked: {join_err}"));
+            }
+            Err(_) => {} // cancelled — already handled above
+        }
+
+        Ok(Some((delta_content, tool_calls, usage)))
+    }
+
     pub async fn run_streaming(self: Arc<Self>, task: &str) -> Result<mpsc::Receiver<StreamChunk>> {
         let (tx, rx) = mpsc::channel(64);
         let task = task.to_string();
@@ -632,7 +770,10 @@ impl KrabsAgent {
         tokio::task::spawn(async move {
             let system_prompt = agent.current_system_prompt().await;
             let messages = vec![Message::system(&system_prompt), Message::user(task.clone())];
-            if let Err(e) = agent.streaming_loop_inner(task, messages, tx.clone()).await {
+            if let Err(e) = agent
+                .streaming_loop_inner(task, messages, None, tx.clone())
+                .await
+            {
                 let _ = tx
                     .send(StreamChunk::Done {
                         usage: crate::providers::provider::TokenUsage {
@@ -665,6 +806,7 @@ impl KrabsAgent {
     pub async fn run_streaming_with_history(
         self: Arc<Self>,
         messages: Vec<Message>,
+        subturn_resume: Option<SubturnResume>,
     ) -> Result<(
         mpsc::Receiver<StreamChunk>,
         oneshot::Receiver<Result<(Option<String>, Vec<Message>)>>,
@@ -681,7 +823,10 @@ impl KrabsAgent {
             .unwrap_or_default();
 
         tokio::task::spawn(async move {
-            match agent.streaming_loop_inner(task, messages, tx.clone()).await {
+            match agent
+                .streaming_loop_inner(task, messages, subturn_resume, tx.clone())
+                .await
+            {
                 Ok(final_messages) => {
                     let _ = done_tx.send(Ok((session_id, final_messages)));
                 }
@@ -704,10 +849,14 @@ impl KrabsAgent {
 
     /// Core streaming loop. `task` is used only for `AgentStart` hook event label.
     /// `messages` is the full initial conversation (system + history + user turn).
+    /// `subturn_resume` is set when resuming from a sub-turn checkpoint: turn 0 skips
+    /// the LLM call and re-uses the tool calls already in `messages`, executing only
+    /// the ones not yet completed.
     async fn streaming_loop_inner(
         &self,
         task: String,
         mut messages: Vec<Message>,
+        mut subturn_resume: Option<SubturnResume>,
         tx: mpsc::Sender<StreamChunk>,
     ) -> Result<Vec<Message>> {
         let tool_defs = self.registry.tool_defs();
@@ -780,70 +929,42 @@ impl KrabsAgent {
                 messages.len()
             );
 
-            // Bounded channel large enough for any realistic streaming response.
-            // Previously capacity 64 caused a deadlock: stream_complete was
-            // awaited synchronously inside call_with_retry while the consumer
-            // loop below only ran after call_with_retry returned.  Models with
-            // extended thinking (e.g. Qwen3) easily produce 64+ chunks, filling
-            // the buffer and blocking the producer while the consumer starved.
+            // ── LLM call (or sub-turn resume replay) ─────────────────────────
             //
-            // Fix: spawn stream_complete as a concurrent task so producer and
-            // consumer run in parallel.
-            let (turn_tx, mut turn_rx) = mpsc::channel::<StreamChunk>(4096);
-
-            let provider_for_stream = Arc::clone(&self.provider);
-            let msgs_for_stream = messages.clone();
-            let defs_for_stream = tool_defs.clone();
-            let turn_tx_for_stream = turn_tx.clone();
-            let stream_task: tokio::task::JoinHandle<anyhow::Result<()>> =
-                tokio::task::spawn(async move {
-                    provider_for_stream
-                        .stream_complete(&msgs_for_stream, &defs_for_stream, turn_tx_for_stream)
-                        .await
-                });
-            // Drop the local sender so turn_rx closes once the spawned task's
-            // copy is also dropped (i.e. when stream_complete returns).
-            drop(turn_tx);
-
-            let mut delta_content = String::new();
-            let mut tool_calls_this_turn = Vec::new();
-            let mut usage_this_turn = None;
-
-            while let Some(chunk) = turn_rx.recv().await {
-                match &chunk {
-                    StreamChunk::Delta { text } => delta_content.push_str(text),
-                    StreamChunk::ToolCallReady { call } => {
-                        tool_calls_this_turn.push(call.clone());
+            // On turn 0 of a sub-turn resume, the LLM has already issued its tool
+            // call request (persisted as assistant_tool_calls in history). Re-issuing
+            // it would send an incomplete tool-result sequence that most APIs reject.
+            // Instead, extract the existing tool calls from history and skip to the
+            // tool loop. The already-completed calls will be skipped there.
+            //
+            // For all other turns: streaming LLM call with exponential-backoff retry.
+            let (delta_content, tool_calls_this_turn, usage_this_turn) = if turn == 0 {
+                if let Some(ref sr) = subturn_resume {
+                    // LLM call already happened; re-use the tool calls in history.
+                    let existing_calls = messages
+                        .iter()
+                        .rev()
+                        .find_map(|m| m.tool_calls.as_ref())
+                        .cloned()
+                        .unwrap_or_default();
+                    info!(
+                        completed = sr.completed_tool_count,
+                        total = existing_calls.len(),
+                        "Sub-turn resume: replaying tool calls"
+                    );
+                    (String::new(), existing_calls, None)
+                } else {
+                    match self.stream_with_retry(turn, &messages, &tool_defs, &tx).await? {
+                        Some(v) => v,
+                        None => return Ok(messages), // Ctrl+C
                     }
-                    StreamChunk::Done { usage } => {
-                        usage_this_turn = Some(usage.clone());
-                    }
-                    StreamChunk::Status { .. } => {}
                 }
-                if matches!(
-                    chunk,
-                    StreamChunk::Delta { .. } | StreamChunk::ToolCallReady { .. }
-                ) && tx.send(chunk).await.is_err()
-                {
-                    // Consumer dropped (Ctrl+C) — stop the loop.
-                    stream_task.abort();
-                    return Ok(messages);
+            } else {
+                match self.stream_with_retry(turn, &messages, &tool_defs, &tx).await? {
+                    Some(v) => v,
+                    None => return Ok(messages), // Ctrl+C
                 }
-            }
-
-            // Propagate any error from the streaming task.
-            match stream_task.await {
-                Ok(Err(e)) => {
-                    self.persist_error(turn, "llm_stream", &e, 0).await;
-                    return Err(e);
-                }
-                Err(join_err) if !join_err.is_cancelled() => {
-                    let e = anyhow::anyhow!("stream task panicked: {join_err}");
-                    self.persist_error(turn, "llm_stream", &e, 0).await;
-                    return Err(e);
-                }
-                _ => {}
-            }
+            };
 
             if let Some(usage) = usage_this_turn {
                 self.total_input_tokens
@@ -861,16 +982,39 @@ impl KrabsAgent {
                     turn,
                     tool_calls_this_turn.len()
                 );
-                let assistant_msg = Message::assistant_tool_calls(tool_calls_this_turn.clone());
-                self.persist_message(&assistant_msg, turn).await;
-                messages.push(assistant_msg);
 
-                for mut call in tool_calls_this_turn {
+                // On sub-turn resume the assistant_tool_calls message is already
+                // persisted and already in `messages` — don't duplicate it.
+                let resuming_subturn = subturn_resume.is_some();
+                if !resuming_subturn {
+                    let assistant_msg =
+                        Message::assistant_tool_calls(tool_calls_this_turn.clone());
+                    self.persist_message(&assistant_msg, turn).await;
+                    messages.push(assistant_msg);
+                }
+
+                // How many tool calls were already completed before the crash.
+                let skip_count = subturn_resume
+                    .as_ref()
+                    .map(|sr| sr.completed_tool_count)
+                    .unwrap_or(0);
+
+                for (tool_idx, mut call) in tool_calls_this_turn.into_iter().enumerate() {
+                    // Skip calls whose results are already in the history.
+                    if tool_idx < skip_count {
+                        debug!(
+                            "Sub-turn resume: skipping already-completed tool '{}' (idx {})",
+                            call.name, tool_idx
+                        );
+                        continue;
+                    }
                     if !self.permissions.is_allowed(&call.name) {
                         let msg = format!("Permission denied for tool: {}", call.name);
                         warn!("{}", msg);
                         let result_msg = Message::tool_result(&msg, &call.id, &call.name);
                         self.persist_message(&result_msg, turn).await;
+                        self.write_subturn_checkpoint(turn, tool_idx, &call.id)
+                            .await;
                         messages.push(result_msg);
                         continue;
                     }
@@ -891,6 +1035,8 @@ impl KrabsAgent {
                             warn!("{}", msg);
                             let result_msg = Message::tool_result(&msg, &call.id, &call.name);
                             self.persist_message(&result_msg, turn).await;
+                            self.write_subturn_checkpoint(turn, tool_idx, &call.id)
+                                .await;
                             messages.push(result_msg);
                             continue;
                         }
@@ -944,6 +1090,9 @@ impl KrabsAgent {
                             }
                             let result_msg = Message::tool_result(&content, &call.id, &call.name);
                             self.persist_message(&result_msg, turn).await;
+                            // Sub-turn checkpoint: safe resume point after this tool result.
+                            self.write_subturn_checkpoint(turn, tool_idx, &call.id)
+                                .await;
                             messages.push(result_msg);
                         }
                         None => {
@@ -951,11 +1100,15 @@ impl KrabsAgent {
                             warn!("{}", msg);
                             let result_msg = Message::tool_result(&msg, &call.id, &call.name);
                             self.persist_message(&result_msg, turn).await;
+                            self.write_subturn_checkpoint(turn, tool_idx, &call.id)
+                                .await;
                             messages.push(result_msg);
                         }
                     }
                 }
 
+                // Sub-turn resume is consumed after the first tool turn completes.
+                subturn_resume = None;
                 self.write_checkpoint(turn).await;
                 self.hooks.fire(&HookEvent::TurnEnd { turn }).await;
             } else {

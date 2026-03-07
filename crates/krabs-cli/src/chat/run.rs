@@ -106,13 +106,15 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
     // before the first message is sent.
     let mut active_resume_id: Option<String> = None;
     let mut pending_session_id: Option<String> = None;
+    let mut pending_subturn_resume: Option<krabs_core::SubturnResume> = None;
     if let Some(ref sid) = resume_id {
-        let (history, display_msgs) = load_resume_history(&krabs_config, sid).await;
+        let (history, display_msgs, sr): (Vec<_>, Vec<_>, _) = load_resume_history(&krabs_config, sid).await;
         if !history.is_empty() {
             for dm in display_msgs {
                 app.chat.push(dm);
             }
             messages = history;
+            pending_subturn_resume = sr;
             active_resume_id = Some(sid.clone());
             info.session_id = Some(sid.clone());
             app.push(ChatMsg::Info(format!("Resumed session {sid}")));
@@ -208,7 +210,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 None,
                             )
                             .await;
-                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, None, tx)));
                         }
                     }
                     Some(DisplayEvent::Error { message, session_id }) => {
@@ -238,7 +240,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 None,
                             )
                             .await;
-                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, tx)));
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, None, tx)));
                         }
                     }
                     Some(DisplayEvent::Status(text)) => {
@@ -701,7 +703,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 if sid.is_empty() {
                                     app.push(ChatMsg::Error("usage: /resume <session-id>".into()));
                                 } else {
-                                    let (history, display_msgs) =
+                                    let (history, display_msgs, sr): (Vec<_>, Vec<_>, _) =
                                         load_resume_history(&krabs_config, sid).await;
                                     if history.is_empty() {
                                         app.push(ChatMsg::Error(format!(
@@ -716,6 +718,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                             app.chat.push(dm);
                                         }
                                         messages = history;
+                                        pending_subturn_resume = sr;
                                         active_resume_id = Some(sid.to_string());
                                         app.push(ChatMsg::Info(format!(
                                             "Resumed session {sid}"
@@ -799,6 +802,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 turn_handle = Some(tokio::spawn(run_agent_turn(
                                     agent,
                                     turn_messages,
+                                    pending_subturn_resume.take(),
                                     tx,
                                 )));
                             }

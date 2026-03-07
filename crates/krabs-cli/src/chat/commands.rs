@@ -600,31 +600,37 @@ pub(super) async fn cmd_usage(app: &mut App, max_ctx: u32, skills_config: &Skill
 }
 
 /// Load a persisted session's history and convert it to display messages.
-/// Returns `(messages_for_agent, display_messages_for_tui)`.
+/// Returns `(messages_for_agent, display_messages_for_tui, subturn_resume)`.
 pub(super) async fn load_resume_history(
     config: &KrabsConfig,
     session_id: &str,
-) -> (Vec<Message>, Vec<ChatMsg>) {
+) -> (Vec<Message>, Vec<ChatMsg>, Option<krabs_core::SubturnResume>) {
     use krabs_core::{session::session::Session as KrabsSession, SessionStore};
 
     let store = match SessionStore::open(&config.db_path).await {
         Ok(s) => s,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(_) => return (Vec::new(), Vec::new(), None),
     };
     let session = match store.load_session(session_id).await {
         Ok(s) => s,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(_) => return (Vec::new(), Vec::new(), None),
     };
 
-    let stored = match session.latest_checkpoint().await {
+    let (stored, subturn_resume) = match session.latest_checkpoint().await {
         Ok(Some(cp)) => {
             let _ = session.rollback_to(cp.last_msg_id).await;
-            session
+            let msgs = session
                 .messages_up_to(cp.last_msg_id)
                 .await
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let sr = cp.subturn_tool_idx.map(|idx| krabs_core::SubturnResume {
+                turn: cp.turn,
+                completed_tool_count: idx + 1,
+                last_call_id: cp.subturn_call_id.unwrap_or_default(),
+            });
+            (msgs, sr)
         }
-        _ => session.messages().await.unwrap_or_default(),
+        _ => (session.messages().await.unwrap_or_default(), None),
     };
 
     let mut messages = Vec::new();
@@ -642,7 +648,7 @@ pub(super) async fn load_resume_history(
         }
     }
 
-    (messages, display)
+    (messages, display, subturn_resume)
 }
 
 pub(super) fn build_registry() -> ToolRegistry {

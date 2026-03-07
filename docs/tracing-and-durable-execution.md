@@ -195,8 +195,10 @@ errors
 
 checkpoints
   id, session_id, agent_id, turn
-  last_msg_id INTEGER       -- MAX(messages.id) at checkpoint time
-  created_at  INTEGER
+  last_msg_id        INTEGER   -- MAX(messages.id) at checkpoint time
+  subturn_tool_idx   INTEGER   -- NULL = full-turn; NOT NULL = sub-turn (0-indexed)
+  subturn_call_id    TEXT      -- tool_call_id of last completed call (sub-turn only)
+  created_at         INTEGER
 ```
 
 ---
@@ -232,14 +234,19 @@ write_checkpoint(turn)
 1. load_session(id)
 2. latest_checkpoint()
 3. If checkpoint:
-     rollback_to(last_msg_id)   -- DELETE messages WHERE id > last_msg_id
+     rollback_to(last_msg_id)    -- DELETE messages WHERE id > last_msg_id
      messages_up_to(last_msg_id) -- reload clean history
+     If subturn_tool_idx IS NOT NULL:
+       return ResumeState { messages, subturn_resume: Some(SubturnResume { turn, completed_tool_count, last_call_id }) }
 4. If no checkpoint:
      load all messages (best-effort)
 5. Continue agent loop from recovered state
+   Sub-turn resume: agent loop skips tool calls whose idx < completed_tool_count
 ```
 
 **Rollback** handles crash scenarios where the agent died mid-turn and left partial messages.
+For sub-turn crashes the rollback removes only the partial tool result written after the last
+`write_subturn_checkpoint`, preserving all prior completed tool results.
 
 ---
 
@@ -250,7 +257,8 @@ Newest user message submitted  → persist_message(msg, turn=0)   [streaming pat
 Each LLM message received      → persist_message(msg, turn)
 Each LLM call completes        → persist_token_usage(turn, in, out)
 Each retry failure             → persist_error(turn, context, error, attempt)
-After each successful turn     → write_checkpoint(turn)
+After each tool result         → write_subturn_checkpoint(turn, tool_idx, call_id)
+After each successful turn     → write_checkpoint(turn)          [full-turn, clears subturn]
 ```
 
 > **Streaming path detail:** `streaming_loop_inner` persists the **last** (newest) user
@@ -267,14 +275,15 @@ System messages **are persisted** alongside other roles. On resume, the full con
 - Exponential backoff: `base_ms * 2^attempt` (base 500ms default)
 - Each failure calls `persist_error(turn, context, error, attempt)` with the 0-indexed attempt
 - Max retries: `config.max_retries` (default 3, so 4 total attempts)
-- Each retry emits a `StreamChunk::Status` via `status_tx` (streaming path) so the CLI shows retry progress
-- Failures are `warn!`, not `error!` — after exhausting retries the `Err` propagates and the agent loop decides whether to abort
+- Each retry emits a `StreamChunk::Status` via `status_tx` so the CLI shows retry progress
+- Failures are `warn!`, not `error!` — after exhausting retries the `Err` propagates
 
-> **Streaming path note:** For the streaming loop, `stream_complete` is **not** wrapped in
-> `call_with_retry`. It is spawned as a concurrent `tokio::task` so the producer and
-> chunk-consumer run in parallel. If the task returns an error, it is persisted via
-> `persist_error` and the loop returns `Err`. `call_with_retry` is still used for the
-> non-streaming (`run` / `complete`) path.
+> **Streaming path:** The streaming loop uses `stream_one_attempt` (a concurrent
+> producer/consumer task) wrapped in its own retry loop identical in semantics to
+> `call_with_retry`. Retry is only safe before any delta or tool call is forwarded to
+> the CLI — once output is in-flight the attempt cannot be rewound. The retry loop
+> breaks out early with `return Ok(messages)` if the CLI consumer drops (Ctrl+C).
+> `call_with_retry` is used for the non-streaming (`run` / `complete`) path.
 
 ---
 
