@@ -5,10 +5,10 @@ Krabs (or Mr. Krabs) is an agentic framework doing a lot of things.
 # Project structure
 ```text
 crates/
-├── krabs-core        # core logic
+├── krabs-core        # core logic: agents, providers, tools, MCP client
 ├── krabs-cli         # CLI entry
-├── krabs-server      # backend
-└── krabs-mcp         # MCP extensions
+├── krabs-server      # backend (not yet scaffolded)
+└── krabs-mcp         # standalone MCP server: stdio + SSE, tool registry, notifications
 ```
 
 # Planning loops
@@ -30,8 +30,21 @@ crates/
 ```
 
 # Entrypoint
-- `krabs-core`: `./crates/krabs-core/agents/agents.rs`
-- `krabs-cli`: `./crates/krabs-cli/krabs-cli/main.rs`
+- `krabs-core`: `./crates/krabs-core/src/agents/agents.rs`
+- `krabs-cli`: `./crates/krabs-cli/src/main.rs`
+- `krabs-mcp`: `./crates/krabs-mcp/src/bin/main.rs` (binary); `./crates/krabs-mcp/src/lib.rs` (library)
+
+# krabs-mcp binary
+```
+krabs-mcp               # stdio — default, used by Claude Desktop
+krabs-mcp --sse         # SSE on 127.0.0.1:3000
+krabs-mcp --sse <addr>  # SSE on custom address
+```
+
+Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{ "mcpServers": { "krabs": { "command": "/path/to/target/release/krabs-mcp" } } }
+```
 
 # Core rules
 - Every byte allocated is a byte that must earn its keep. No unnecessary heap allocations. No lazy clones when a borrow will do. Resource efficiency isn't a nice-to-have — it's the *law*.

@@ -7,6 +7,10 @@ edition = "2021"
 name = "krabs_mcp"
 path = "src/lib.rs"
 
+[[bin]]
+name = "krabs-mcp"
+path = "src/bin/main.rs"
+
 [[example]]
 name = "stdio_server"
 path = "examples/stdio_server.rs"

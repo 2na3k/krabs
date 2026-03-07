@@ -14,10 +14,10 @@ Built on `tokio` for async-first execution. Every layer is a trait. Every failur
 
 ```
 crates/
-├── krabs-core     # agent engine, providers, tools, hooks, skills, MCP
+├── krabs-core     # agent engine, providers, tools, hooks, skills, MCP client
 ├── krabs-cli      # interactive TUI — the main way to use Krabs
-├── krabs-server   # HTTP backend (in progress)
-└── krabs-mcp      # MCP server extensions (in progress)
+├── krabs-server   # HTTP backend (not yet scaffolded)
+└── krabs-mcp      # standalone MCP server — stdio + SSE transports, built-in tools
 ```
 
 ## Quick start
@@ -55,7 +55,9 @@ Switch models mid-session with `/models <model-name>`.
 
 **Hooks** — React to agent lifecycle events: `AgentStart`, `PreToolUse`, `PostToolUse`, `AgentStop`, and more. Block, modify, or augment tool calls without touching agent logic.
 
-**MCP** — Connect any MCP-compatible server via stdio or SSE transport. Tools appear namespaced as `mcp__{server}__{tool}`.
+**MCP client** — Connect any MCP-compatible server via stdio or SSE transport. Tools appear namespaced as `mcp__{server}__{tool}`.
+
+**MCP server** (`krabs-mcp`) — Run Krabs itself as an MCP server over stdio or SSE. Ships `web_fetch`, `web_search`, and `echo` out of the box. Supports runtime tool registration with live `notifications/tools/list_changed` push to all connected clients. Integrates with Claude Desktop in one config line.
 
 **Personas** — Place `*.md` files in `krabs/agents/`. Invoke with `@<name>` in the chat.
 
@@ -98,3 +100,4 @@ See [`docs/config-schema.md`](docs/config-schema.md) for the full schema.
 
 - [`krabs-core`](crates/krabs-core/README.md) — the agent engine
 - [`krabs-cli`](crates/krabs-cli/README.md) — the interactive interface
+- [`krabs-mcp`](crates/krabs-mcp/README.md) — standalone MCP server
