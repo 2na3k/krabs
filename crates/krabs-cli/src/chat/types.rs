@@ -14,6 +14,8 @@ pub(super) enum ChatMsg {
     ToolCall(String),
     ToolResult(String),
     Usage(u32, u32),
+    /// End-of-turn marker: elapsed seconds for the full thinking+answering cycle.
+    TurnEnd(f64),
     Info(String),
     Error(String),
 }
@@ -79,6 +81,15 @@ impl ChatMsg {
                 Line::from(Span::styled(
                     format!("  [{i} in / {o} out tokens]"),
                     Style::default().fg(Color::DarkGray),
+                )),
+                Line::raw(""),
+            ],
+            ChatMsg::TurnEnd(secs) => vec![
+                Line::from(Span::styled(
+                    format!("  ── thinking and answering in {secs:.1}s ──"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
                 )),
                 Line::raw(""),
             ],

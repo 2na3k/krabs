@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Instant;
 
 use krabs_core::AgentPersona;
 
@@ -18,6 +19,7 @@ pub(super) struct App {
     pub(super) history_idx: Option<usize>,
     pub(super) spinning: bool,
     pub(super) spin_i: usize,
+    pub(super) turn_start: Option<Instant>,
     pub(super) total_input: u32,
     pub(super) total_output: u32,
     pub(super) suggest_idx: Option<usize>, // selected index in suggestion popup
@@ -51,8 +53,9 @@ impl App {
             history: Vec::new(),
             history_idx: None,
             spinning: false,
-            suggest_idx: None,
             spin_i: 0,
+            turn_start: None,
+            suggest_idx: None,
             total_input: 0,
             total_output: 0,
             active_persona: None,

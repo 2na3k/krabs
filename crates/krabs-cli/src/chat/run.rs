@@ -145,6 +145,8 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         }
                         app.spinning = false;
                         stream_rx = None;
+                        app.auto_scroll = true;
+                        app.scroll = u16::MAX;
                     }
                     Some(DisplayEvent::Token(t)) => {
                         app.spinning = false;
@@ -189,6 +191,14 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         app.spinning = false;
                         stream_rx = None;
                         turn_handle = None;
+                        if let Some(start) = app.turn_start.take() {
+                            app.push(ChatMsg::TurnEnd(start.elapsed().as_secs_f64()));
+                        }
+                        // Always snap to bottom when the turn completes so the full
+                        // response (including the timing line) is visible regardless of
+                        // whether the user scrolled up during streaming.
+                        app.auto_scroll = true;
+                        app.scroll = u16::MAX;
                         if session_id.is_some() {
                             info.session_id = session_id.clone();
                             active_resume_id = session_id;
@@ -198,6 +208,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                             turn_messages.push(Message::user(&queued));
                             messages.push(Message::user(&queued));
                             app.spinning = true;
+                            app.turn_start = Some(std::time::Instant::now());
                             let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
                             stream_rx = Some(rx);
                             let agent = build_agent(
@@ -219,6 +230,8 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         stream_rx = None;
                         turn_handle = None;
                         app.push(ChatMsg::Error(message));
+                        app.auto_scroll = true;
+                        app.scroll = u16::MAX;
                         if session_id.is_some() {
                             info.session_id = session_id.clone();
                             active_resume_id = session_id;
@@ -317,90 +330,6 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         _ => {}
                     }
                     continue 'main;
-                }
-
-                // Scroll (always available)
-                match key.code {
-                    KeyCode::Up if !busy => {
-                        let slash_sugg = slash_suggestions(&app.input);
-                        let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
-                            at_suggestions(&app.input[1..], &app.personas)
-                        } else {
-                            vec![]
-                        };
-                        if app.input.starts_with('/') && !slash_sugg.is_empty() {
-                            let len = slash_sugg.len();
-                            app.suggest_idx = Some(match app.suggest_idx {
-                                None | Some(0) => len - 1,
-                                Some(i) => i - 1,
-                            });
-                        } else if app.input.starts_with('@') && !at_sugg.is_empty() {
-                            let len = at_sugg.len();
-                            app.suggest_idx = Some(match app.suggest_idx {
-                                None | Some(0) => len - 1,
-                                Some(i) => i - 1,
-                            });
-                        } else {
-                            app.auto_scroll = false;
-                            app.scroll = app.scroll.saturating_sub(3);
-                        }
-                        continue 'main;
-                    }
-                    KeyCode::Down if !busy => {
-                        let slash_sugg = slash_suggestions(&app.input);
-                        let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
-                            at_suggestions(&app.input[1..], &app.personas)
-                        } else {
-                            vec![]
-                        };
-                        if app.input.starts_with('/') && !slash_sugg.is_empty() {
-                            let len = slash_sugg.len();
-                            app.suggest_idx = Some(match app.suggest_idx {
-                                None => 0,
-                                Some(i) => (i + 1) % len,
-                            });
-                        } else if app.input.starts_with('@') && !at_sugg.is_empty() {
-                            let len = at_sugg.len();
-                            app.suggest_idx = Some(match app.suggest_idx {
-                                None => 0,
-                                Some(i) => (i + 1) % len,
-                            });
-                        } else {
-                            app.scroll = app.scroll.saturating_add(3);
-                            if app.scroll >= app.max_scroll {
-                                app.scroll = u16::MAX;
-                                app.auto_scroll = true;
-                            }
-                        }
-                        continue 'main;
-                    }
-                    KeyCode::Up => {
-                        app.auto_scroll = false;
-                        app.scroll = app.scroll.saturating_sub(3);
-                        continue 'main;
-                    }
-                    KeyCode::Down => {
-                        app.scroll = app.scroll.saturating_add(3);
-                        if app.scroll >= app.max_scroll {
-                            app.scroll = u16::MAX;
-                            app.auto_scroll = true;
-                        }
-                        continue 'main;
-                    }
-                    KeyCode::PageUp => {
-                        app.auto_scroll = false;
-                        app.scroll = app.scroll.saturating_sub(10);
-                        continue 'main;
-                    }
-                    KeyCode::PageDown => {
-                        app.scroll = app.scroll.saturating_add(10);
-                        if app.scroll >= app.max_scroll {
-                            app.scroll = u16::MAX;
-                            app.auto_scroll = true;
-                        }
-                        continue 'main;
-                    }
-                    _ => {}
                 }
 
                 // ── User-input popup ──────────────────────────────────────────
@@ -549,6 +478,90 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         _ => {}
                     }
                     continue 'main;
+                }
+
+                // Scroll (always available)
+                match key.code {
+                    KeyCode::Up if !busy => {
+                        let slash_sugg = slash_suggestions(&app.input);
+                        let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
+                            at_suggestions(&app.input[1..], &app.personas)
+                        } else {
+                            vec![]
+                        };
+                        if app.input.starts_with('/') && !slash_sugg.is_empty() {
+                            let len = slash_sugg.len();
+                            app.suggest_idx = Some(match app.suggest_idx {
+                                None | Some(0) => len - 1,
+                                Some(i) => i - 1,
+                            });
+                        } else if app.input.starts_with('@') && !at_sugg.is_empty() {
+                            let len = at_sugg.len();
+                            app.suggest_idx = Some(match app.suggest_idx {
+                                None | Some(0) => len - 1,
+                                Some(i) => i - 1,
+                            });
+                        } else {
+                            app.auto_scroll = false;
+                            app.scroll = app.scroll.saturating_sub(3);
+                        }
+                        continue 'main;
+                    }
+                    KeyCode::Down if !busy => {
+                        let slash_sugg = slash_suggestions(&app.input);
+                        let at_sugg = if app.input.starts_with('@') && !app.input.contains(' ') {
+                            at_suggestions(&app.input[1..], &app.personas)
+                        } else {
+                            vec![]
+                        };
+                        if app.input.starts_with('/') && !slash_sugg.is_empty() {
+                            let len = slash_sugg.len();
+                            app.suggest_idx = Some(match app.suggest_idx {
+                                None => 0,
+                                Some(i) => (i + 1) % len,
+                            });
+                        } else if app.input.starts_with('@') && !at_sugg.is_empty() {
+                            let len = at_sugg.len();
+                            app.suggest_idx = Some(match app.suggest_idx {
+                                None => 0,
+                                Some(i) => (i + 1) % len,
+                            });
+                        } else {
+                            app.scroll = app.scroll.saturating_add(3);
+                            if app.scroll >= app.max_scroll {
+                                app.scroll = u16::MAX;
+                                app.auto_scroll = true;
+                            }
+                        }
+                        continue 'main;
+                    }
+                    KeyCode::Up => {
+                        app.auto_scroll = false;
+                        app.scroll = app.scroll.saturating_sub(3);
+                        continue 'main;
+                    }
+                    KeyCode::Down => {
+                        app.scroll = app.scroll.saturating_add(3);
+                        if app.scroll >= app.max_scroll {
+                            app.scroll = u16::MAX;
+                            app.auto_scroll = true;
+                        }
+                        continue 'main;
+                    }
+                    KeyCode::PageUp => {
+                        app.auto_scroll = false;
+                        app.scroll = app.scroll.saturating_sub(10);
+                        continue 'main;
+                    }
+                    KeyCode::PageDown => {
+                        app.scroll = app.scroll.saturating_add(10);
+                        if app.scroll >= app.max_scroll {
+                            app.scroll = u16::MAX;
+                            app.auto_scroll = true;
+                        }
+                        continue 'main;
+                    }
+                    _ => {}
                 }
 
                 match key.code {
@@ -789,6 +802,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 turn_messages.push(Message::user(&input));
                                 messages.push(Message::user(&input));
                                 app.spinning = true;
+                                app.turn_start = Some(std::time::Instant::now());
 
                                 // Capture context breakdown estimates (once per turn)
                                 const BASE_SYSTEM_PROMPT: &str = "You are Krabs, an agentic assistant.";

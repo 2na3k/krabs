@@ -165,20 +165,22 @@ pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Fr
         )));
     }
 
-    // Scroll clamping — use visual row count so wrapped lines are counted correctly.
+    // Build the chat widget so we can ask ratatui itself how many visual rows
+    // it needs (using the real WordWrapper, accounting for word-wrap correctly).
+    let chat_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(" chat ", Style::default().fg(Color::DarkGray)));
+
+    let msg_widget = Paragraph::new(lines)
+        .block(chat_block)
+        .wrap(Wrap { trim: false });
+
+    // line_count(inner_w) uses the actual word-wrap algorithm and returns the
+    // total visual rows INCLUDING the 2 block border rows — subtract them.
     let inner_w = chunks[1].width.saturating_sub(2);
-    let total_visual: u16 = lines
-        .iter()
-        .map(|line| {
-            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-            if inner_w == 0 || len == 0 {
-                1u16
-            } else {
-                len.div_ceil(inner_w as usize) as u16
-            }
-        })
-        .sum();
     let view_h = chunks[1].height.saturating_sub(2);
+    let total_visual = msg_widget.line_count(inner_w).saturating_sub(2) as u16;
     let max_scroll = total_visual.saturating_sub(view_h);
     app.max_scroll = max_scroll;
     if app.scroll == u16::MAX {
@@ -186,16 +188,7 @@ pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Fr
     }
     app.scroll = app.scroll.min(max_scroll);
 
-    let msg_widget = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(" chat ", Style::default().fg(Color::DarkGray))),
-        )
-        .scroll((app.scroll, 0))
-        .wrap(Wrap { trim: false });
-
+    let msg_widget = msg_widget.scroll((app.scroll, 0));
     frame.render_widget(msg_widget, chunks[1]);
 
     // ── input box ─────────────────────────────────────────────────────────────

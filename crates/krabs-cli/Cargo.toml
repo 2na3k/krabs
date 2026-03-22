@@ -15,6 +15,6 @@ anyhow = "1"
 dirs = "5"
 rpassword = "7"
 dotenvy = "0.15"
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 serde_json = "1.0.149"
