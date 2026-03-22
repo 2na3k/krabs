@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use krabs_core::{
-    skills::loader::SkillLoader, AgentPersona, BaseAgent, BashTool, Credentials, CustomModelEntry,
-    GlobTool, GrepTool, HookConfig, HookEntry, KrabsConfig, LlmProvider, McpRegistry, McpServer,
-    Message, ReadTool, SkillsConfig, ToolRegistry, WebFetchTool, WriteTool,
+    skills::loader::SkillLoader, AgentPersona, BaseAgent, Credentials, CustomModelEntry,
+    HookConfig, HookEntry, KrabsConfig, LlmProvider, McpRegistry, McpServer, Message, SkillsConfig,
+    ToolRegistry,
 };
 
 use super::app::App;
@@ -656,12 +656,5 @@ pub(super) async fn load_resume_history(
 }
 
 pub(super) fn build_registry() -> ToolRegistry {
-    let mut r = ToolRegistry::new();
-    r.register(Arc::new(BashTool));
-    r.register(Arc::new(GlobTool));
-    r.register(Arc::new(GrepTool));
-    r.register(Arc::new(ReadTool));
-    r.register(Arc::new(WebFetchTool));
-    r.register(Arc::new(WriteTool));
-    r
+    ToolRegistry::with_defaults()
 }

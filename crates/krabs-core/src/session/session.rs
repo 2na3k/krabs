@@ -130,6 +130,16 @@ pub struct StoredCheckpoint {
     pub created_at: i64,
 }
 
+/// Summary of a persisted session (returned by `SessionStore::list_sessions`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub agent_id: String,
+    pub model: String,
+    pub provider: String,
+    pub created_at: i64,
+}
+
 // ── Resume helpers ────────────────────────────────────────────────────────────
 
 /// Metadata about an in-progress (sub-turn) resume.
@@ -236,6 +246,61 @@ impl SessionStore {
             agent_id,
             pool: self.pool.clone(),
         }))
+    }
+
+    /// List all sessions ordered by creation time (newest first).
+    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        let rows =
+            sqlx::query("SELECT id, agent_id, model, provider, created_at FROM sessions ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            result.push(SessionSummary {
+                id: row.try_get("id")?,
+                agent_id: row.try_get("agent_id")?,
+                model: row.try_get("model")?,
+                provider: row.try_get("provider")?,
+                created_at: row.try_get("created_at")?,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Delete a session and all related data (messages, token usage, errors, checkpoints).
+    pub async fn delete_session(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM checkpoints WHERE session_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM errors WHERE session_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM token_usage WHERE session_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM messages WHERE session_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Count messages in a session.
+    pub async fn session_message_count(&self, id: &str) -> Result<usize> {
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM messages WHERE session_id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        let count: i64 = row.try_get("cnt")?;
+        Ok(count as usize)
     }
 }
 

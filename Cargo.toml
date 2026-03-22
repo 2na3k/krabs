@@ -2,7 +2,7 @@
 members = [
     "crates/krabs-core",
     "crates/krabs-cli",
-    # "crates/krabs-server",  # not yet scaffolded
+    "crates/krabs-server",
     "crates/krabs-mcp",
     # "crates/krabs-sdk",     # not yet scaffolded
 ]

@@ -14,7 +14,10 @@ pub mod tools;
 
 pub use agents::agent::{Agent, AgentOutput, KrabsAgent, KrabsAgentBuilder};
 pub use agents::base_agent::BaseAgent;
+pub use agents::context::{ConversationContext, TurnInput};
+pub use agents::factory::{AgentFactory, SessionOpts};
 pub use agents::persona::AgentPersona;
+pub use agents::pool::{AgentHandle, AgentId, AgentPool, AgentStatus, HandleError, PoolError};
 pub use config::config::{
     CustomModelEntry, KrabsConfig, LangfuseConfig, RouterConfig, RouterRule, SkillsConfig,
     TelemetryConfig,
@@ -35,7 +38,8 @@ pub use sandbox::{SandboxConfig, SandboxProxy, SandboxedTool};
 
 pub use providers::{AnthropicProvider, GeminiProvider, OpenAiProvider};
 pub use session::session::{
-    ResumeState, Session, SessionStore, StoredCheckpoint, StoredError, StoredMessage, SubturnResume,
+    ResumeState, Session, SessionStore, SessionSummary, StoredCheckpoint, StoredError,
+    StoredMessage, SubturnResume,
 };
 pub use skills::{FsSkill, SkillRegistry};
 pub use tools::bash::BashTool;

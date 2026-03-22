@@ -7,7 +7,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use krabs_core::{AgentPersona, Credentials, KrabsConfig, LlmProvider, Message, Role};
+use krabs_core::{
+    AgentPersona, ConversationContext, Credentials, KrabsConfig, LlmProvider, Message, Role,
+};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use tokio::sync::mpsc;
@@ -99,14 +101,15 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
     for tool in &krabs_config.auto_approve_tools {
         app.approved_tools.insert(tool.clone());
     }
-    let mut messages: Vec<Message> = Vec::new();
+    // Conversation context: the canonical source of truth for messages
+    // across multi-turn conversations.
+    let mut ctx: ConversationContext;
 
     // If resuming, reconstruct history from the persisted session.
     // Otherwise generate a fresh session ID upfront so it shows in the info bar
     // before the first message is sent.
     let mut active_resume_id: Option<String> = None;
     let mut pending_session_id: Option<String> = None;
-    let mut pending_subturn_resume: Option<krabs_core::SubturnResume> = None;
     if let Some(ref sid) = resume_id {
         let (history, display_msgs, sr): (Vec<_>, Vec<_>, _) =
             load_resume_history(&krabs_config, sid).await;
@@ -114,13 +117,15 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
             for dm in display_msgs {
                 app.chat.push(dm);
             }
-            messages = history;
-            pending_subturn_resume = sr;
+            ctx = ConversationContext::from_history(history, sr);
             active_resume_id = Some(sid.clone());
             info.session_id = Some(sid.clone());
             app.push(ChatMsg::Info(format!("Resumed session {sid}")));
+        } else {
+            ctx = ConversationContext::new();
         }
     } else {
+        ctx = ConversationContext::new();
         let new_id = krabs_core::new_session_id();
         info.session_id = Some(new_id.clone());
         pending_session_id = Some(new_id);
@@ -187,7 +192,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                         app.push(ChatMsg::Usage(u.input_tokens, u.output_tokens));
                     }
                     Some(DisplayEvent::Done { messages: final_msgs, session_id }) => {
-                        messages = final_msgs;
+                        ctx.complete_turn(final_msgs);
                         app.spinning = false;
                         stream_rx = None;
                         turn_handle = None;
@@ -204,9 +209,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                             active_resume_id = session_id;
                         }
                         if let Some(queued) = app.queued_input.take() {
-                            let mut turn_messages = messages.clone();
-                            turn_messages.push(Message::user(&queued));
-                            messages.push(Message::user(&queued));
+                            let turn_input = ctx.begin_turn(&queued);
                             app.spinning = true;
                             app.turn_start = Some(std::time::Instant::now());
                             let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
@@ -222,7 +225,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 None,
                             )
                             .await;
-                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, None, tx)));
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_input.messages, turn_input.subturn_resume, tx)));
                         }
                     }
                     Some(DisplayEvent::Error { message, session_id }) => {
@@ -237,9 +240,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                             active_resume_id = session_id;
                         }
                         if let Some(queued) = app.queued_input.take() {
-                            let mut turn_messages = messages.clone();
-                            turn_messages.push(Message::user(&queued));
-                            messages.push(Message::user(&queued));
+                            let turn_input = ctx.begin_turn(&queued);
                             app.spinning = true;
                             let (tx, rx) = mpsc::channel::<DisplayEvent>(64);
                             stream_rx = Some(rx);
@@ -254,7 +255,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 None,
                             )
                             .await;
-                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_messages, None, tx)));
+                            turn_handle = Some(tokio::spawn(run_agent_turn(agent, turn_input.messages, turn_input.subturn_resume, tx)));
                         }
                     }
                     Some(DisplayEvent::Status(text)) => {
@@ -717,7 +718,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                             "/quit" => break 'main,
                             "/clear" => {
                                 app.chat.clear();
-                                messages.clear();
+                                ctx = ConversationContext::new();
                                 active_resume_id = None;
                                 app.total_input = 0;
                                 app.total_output = 0;
@@ -735,14 +736,12 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                         )));
                                     } else {
                                         app.chat.clear();
-                                        messages.clear();
+                                        ctx = ConversationContext::from_history(history, sr);
                                         app.total_input = 0;
                                         app.total_output = 0;
                                         for dm in display_msgs {
                                             app.chat.push(dm);
                                         }
-                                        messages = history;
-                                        pending_subturn_resume = sr;
                                         active_resume_id = Some(sid.to_string());
                                         app.push(ChatMsg::Info(format!(
                                             "Resumed session {sid}"
@@ -783,14 +782,14 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                             _ => {
                                 app.push(ChatMsg::User(input.clone()));
 
-                                // Build effective messages: prepend system prompt if persona active
-                                let mut turn_messages = messages.clone();
+                                let turn_input = ctx.begin_turn(&input);
+                                // Optionally prepend persona system prompt
+                                let mut turn_messages = turn_input.messages;
                                 if let Some(ref persona) = app.active_persona {
                                     let base_prompt = format!(
                                         "You are Krabs, an agentic assistant.\n\n---\n\n{}",
                                         persona.system_prompt
                                     );
-                                    // Only prepend if no system message exists yet
                                     let has_system = turn_messages
                                         .first()
                                         .map(|m| matches!(m.role, Role::System))
@@ -799,8 +798,6 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                         turn_messages.insert(0, Message::system(&base_prompt));
                                     }
                                 }
-                                turn_messages.push(Message::user(&input));
-                                messages.push(Message::user(&input));
                                 app.spinning = true;
                                 app.turn_start = Some(std::time::Instant::now());
 
@@ -827,7 +824,7 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                                 turn_handle = Some(tokio::spawn(run_agent_turn(
                                     agent,
                                     turn_messages,
-                                    pending_subturn_resume.take(),
+                                    turn_input.subturn_resume,
                                     tx,
                                 )));
                             }
