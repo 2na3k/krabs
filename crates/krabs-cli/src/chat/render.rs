@@ -165,10 +165,22 @@ pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Fr
         )));
     }
 
-    // Scroll clamping
-    let total = lines.len() as u16;
+    // Scroll clamping — use visual row count so wrapped lines are counted correctly.
+    let inner_w = chunks[1].width.saturating_sub(2);
+    let total_visual: u16 = lines
+        .iter()
+        .map(|line| {
+            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            if inner_w == 0 || len == 0 {
+                1u16
+            } else {
+                len.div_ceil(inner_w as usize) as u16
+            }
+        })
+        .sum();
     let view_h = chunks[1].height.saturating_sub(2);
-    let max_scroll = total.saturating_sub(view_h);
+    let max_scroll = total_visual.saturating_sub(view_h);
+    app.max_scroll = max_scroll;
     if app.scroll == u16::MAX {
         app.scroll = max_scroll;
     }

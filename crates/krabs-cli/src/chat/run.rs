@@ -367,7 +367,10 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                             });
                         } else {
                             app.scroll = app.scroll.saturating_add(3);
-                            if app.scroll == u16::MAX { app.auto_scroll = true; }
+                            if app.scroll >= app.max_scroll {
+                                app.scroll = u16::MAX;
+                                app.auto_scroll = true;
+                            }
                         }
                         continue 'main;
                     }
@@ -378,7 +381,10 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                     }
                     KeyCode::Down => {
                         app.scroll = app.scroll.saturating_add(3);
-                        if app.scroll == u16::MAX { app.auto_scroll = true; }
+                        if app.scroll >= app.max_scroll {
+                            app.scroll = u16::MAX;
+                            app.auto_scroll = true;
+                        }
                         continue 'main;
                     }
                     KeyCode::PageUp => {
@@ -388,6 +394,10 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
                     }
                     KeyCode::PageDown => {
                         app.scroll = app.scroll.saturating_add(10);
+                        if app.scroll >= app.max_scroll {
+                            app.scroll = u16::MAX;
+                            app.auto_scroll = true;
+                        }
                         continue 'main;
                     }
                     _ => {}

@@ -11,6 +11,8 @@ pub(super) struct App {
     pub(super) input: String,
     pub(super) cursor: usize,
     pub(super) scroll: u16,
+    /// Last computed max scroll offset (visual rows). Updated each render frame.
+    pub(super) max_scroll: u16,
     pub(super) auto_scroll: bool,
     pub(super) history: Vec<String>,
     pub(super) history_idx: Option<usize>,
@@ -44,6 +46,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             scroll: 0,
+            max_scroll: 0,
             auto_scroll: true,
             history: Vec::new(),
             history_idx: None,
