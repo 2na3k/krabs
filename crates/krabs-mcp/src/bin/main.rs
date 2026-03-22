@@ -12,6 +12,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///   krabs-mcp --sse 0.0.0.0:8080    run SSE server on a custom address
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     let mut args = std::env::args().skip(1);
 
     match args.next().as_deref() {

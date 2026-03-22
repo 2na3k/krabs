@@ -121,7 +121,9 @@ pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Fr
             Span::styled("  session ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 short.to_string(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
     }
@@ -430,7 +432,9 @@ pub(super) fn render(app: &mut App, max_ctx: u32, info: &InfoBar, frame: &mut Fr
 
             // Right-side annotation: base_url for custom/active, group for known
             let annotation = if let Some(u) = &entry.base_url {
-                let u = u.trim_start_matches("http://").trim_start_matches("https://");
+                let u = u
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://");
                 format!("  {}", u)
             } else {
                 format!("  [{}]", entry.group)

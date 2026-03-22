@@ -200,9 +200,7 @@ impl LangfuseHookBuilder {
         if !cfg.enabled || cfg.public_key.is_empty() || cfg.secret_key.is_empty() {
             return None;
         }
-        Some(
-            Self::new(&cfg.public_key, &cfg.secret_key).base_url(&cfg.base_url),
-        )
+        Some(Self::new(&cfg.public_key, &cfg.secret_key).base_url(&cfg.base_url))
     }
 
     /// Override the Langfuse base URL. Defaults to `http://localhost:3000`.
@@ -442,7 +440,6 @@ impl Hook for LangfuseHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn now_iso_looks_like_iso8601() {

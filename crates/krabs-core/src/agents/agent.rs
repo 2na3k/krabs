@@ -692,7 +692,9 @@ impl KrabsAgent {
                 }
             }
         }
-        Ok(Some(attempt_result.expect("loop exited without result or error")))
+        Ok(Some(
+            attempt_result.expect("loop exited without result or error"),
+        ))
     }
 
     /// Perform a single streaming LLM call for one turn.
@@ -954,13 +956,19 @@ impl KrabsAgent {
                     );
                     (String::new(), existing_calls, None)
                 } else {
-                    match self.stream_with_retry(turn, &messages, &tool_defs, &tx).await? {
+                    match self
+                        .stream_with_retry(turn, &messages, &tool_defs, &tx)
+                        .await?
+                    {
                         Some(v) => v,
                         None => return Ok(messages), // Ctrl+C
                     }
                 }
             } else {
-                match self.stream_with_retry(turn, &messages, &tool_defs, &tx).await? {
+                match self
+                    .stream_with_retry(turn, &messages, &tool_defs, &tx)
+                    .await?
+                {
                     Some(v) => v,
                     None => return Ok(messages), // Ctrl+C
                 }
@@ -987,8 +995,7 @@ impl KrabsAgent {
                 // persisted and already in `messages` — don't duplicate it.
                 let resuming_subturn = subturn_resume.is_some();
                 if !resuming_subturn {
-                    let assistant_msg =
-                        Message::assistant_tool_calls(tool_calls_this_turn.clone());
+                    let assistant_msg = Message::assistant_tool_calls(tool_calls_this_turn.clone());
                     self.persist_message(&assistant_msg, turn).await;
                     messages.push(assistant_msg);
                 }

@@ -604,7 +604,11 @@ pub(super) async fn cmd_usage(app: &mut App, max_ctx: u32, skills_config: &Skill
 pub(super) async fn load_resume_history(
     config: &KrabsConfig,
     session_id: &str,
-) -> (Vec<Message>, Vec<ChatMsg>, Option<krabs_core::SubturnResume>) {
+) -> (
+    Vec<Message>,
+    Vec<ChatMsg>,
+    Option<krabs_core::SubturnResume>,
+) {
     use krabs_core::{session::session::Session as KrabsSession, SessionStore};
 
     let store = match SessionStore::open(&config.db_path).await {

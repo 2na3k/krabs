@@ -323,12 +323,6 @@ impl KrabsConfig {
             KrabsConfig::default()
         };
 
-        if config.api_key.is_empty() {
-            config.api_key = std::env::var("KRABS_API_KEY")
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                .unwrap_or_default();
-        }
-
         let local_path = std::env::current_dir()
             .ok()
             .map(|d| d.join(".krabs.json"))
@@ -346,6 +340,36 @@ impl KrabsConfig {
                 }
             }
             config = serde_json::from_value(base)?;
+        }
+
+        // Environment variable overrides — always take highest precedence.
+        if let Ok(v) = std::env::var("KRABS_PROVIDER") {
+            config.provider = v;
+        }
+        if let Ok(v) = std::env::var("KRABS_MODEL") {
+            config.model = v;
+        }
+        if let Ok(v) = std::env::var("KRABS_BASE_URL") {
+            config.base_url = v;
+        }
+        if config.api_key.is_empty() {
+            config.api_key = std::env::var("KRABS_API_KEY")
+                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .or_else(|_| std::env::var("GEMINI_API_KEY"))
+                .unwrap_or_default();
+        }
+        if let Ok(v) = std::env::var("LANGFUSE_PUBLIC_KEY") {
+            config.langfuse.public_key = v;
+        }
+        if let Ok(v) = std::env::var("LANGFUSE_SECRET_KEY") {
+            config.langfuse.secret_key = v;
+        }
+        if let Ok(v) = std::env::var("LANGFUSE_BASE_URL") {
+            config.langfuse.base_url = v;
+        }
+        if std::env::var("LANGFUSE_ENABLED").as_deref() == Ok("true") {
+            config.langfuse.enabled = true;
         }
 
         Ok(config)

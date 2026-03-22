@@ -108,7 +108,8 @@ pub async fn run(creds: Credentials, resume_id: Option<String>) -> Result<()> {
     let mut pending_session_id: Option<String> = None;
     let mut pending_subturn_resume: Option<krabs_core::SubturnResume> = None;
     if let Some(ref sid) = resume_id {
-        let (history, display_msgs, sr): (Vec<_>, Vec<_>, _) = load_resume_history(&krabs_config, sid).await;
+        let (history, display_msgs, sr): (Vec<_>, Vec<_>, _) =
+            load_resume_history(&krabs_config, sid).await;
         if !history.is_empty() {
             for dm in display_msgs {
                 app.chat.push(dm);
