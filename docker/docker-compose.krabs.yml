@@ -1,0 +1,56 @@
+services:
+
+  krabs-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    restart: unless-stopped
+    environment:
+      KRABS_SERVER_BIND: "0.0.0.0:8080"
+      KRABS_SERVER_SECRET_KEY: "${KRABS_SERVER_SECRET_KEY}"
+      KRABS_SERVER_MAX_AGENTS: "${KRABS_SERVER_MAX_AGENTS:-100}"
+      # LLM provider
+      KRABS_PROVIDER: "${KRABS_PROVIDER}"
+      KRABS_API_KEY: "${KRABS_API_KEY:-}"
+      KRABS_BASE_URL: "${KRABS_BASE_URL:-}"
+      KRABS_MODEL: "${KRABS_MODEL}"
+      # Langfuse tracing (optional — only active when LANGFUSE_ENABLED=true)
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}"
+      LANGFUSE_BASE_URL: "${LANGFUSE_BASE_URL:-http://langfuse-web:3000}"
+      RUST_LOG: "${RUST_LOG:-krabs_core=info,krabs_server=info}"
+    volumes:
+      - krabs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  krabs-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    restart: unless-stopped
+    depends_on:
+      krabs-server:
+        condition: service_healthy
+    ports:
+      # WhatsApp webhook — put a TLS reverse proxy in front of this
+      - "${WHATSAPP_PORT:-3001}:3001"
+      # Slack webhook
+      - "${SLACK_PORT:-3002}:3002"
+    environment:
+      KRABS_SERVER_URL: "http://krabs-server:8080"
+      KRABS_SERVER_SECRET_KEY: "${KRABS_SERVER_SECRET_KEY}"
+      WHATSAPP_PORT: "3001"
+      SLACK_PORT: "3002"
+      RUST_LOG: "${RUST_LOG:-krabs_gateway=info}"
+    env_file:
+      - path: ../.env
+        required: false
+
+volumes:
+  krabs-data:
