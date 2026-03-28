@@ -47,6 +47,7 @@ Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_conf
 ```
 
 # Core rules
+- DON'T FUCKING READ THE .env FILE
 - Every byte allocated is a byte that must earn its keep. No unnecessary heap allocations. No lazy clones when a borrow will do. Resource efficiency isn't a nice-to-have — it's the *law*.
 - An agent that waits is an agent that fails. Krabs moves. Tasks are dispatched, tracked, and completed with urgency. Idle cycles are wasted money, and Krabs *hates* wasted money.
 - The borrow checker is not the enemy — it's the first mate. Krabs agents are correct by construction. If it compiles, it ships. Memory safety isn't a constraint; it's a competitive advantage.

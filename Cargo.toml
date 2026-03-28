@@ -4,6 +4,7 @@ members = [
     "crates/krabs-cli",
     "crates/krabs-server",
     "crates/krabs-mcp",
+    "crates/krabs-gateway",
     # "crates/krabs-sdk",     # not yet scaffolded
 ]
 resolver = "2"
